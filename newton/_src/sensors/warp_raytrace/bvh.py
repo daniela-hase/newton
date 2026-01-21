@@ -235,6 +235,41 @@ def compute_particle_bvh_bounds(
 
 
 @wp.kernel(enable_backward=False)
+def compute_gsplat_bvh_bounds(
+    num_vertices: wp.int32,
+    num_worlds: wp.int32,
+    gsplat_transforms: wp.array(dtype=wp.transformf),
+    gsplat_scales: wp.array(dtype=wp.vec3f),
+    out_bvh_lowers: wp.array(dtype=wp.vec3f),
+    out_bvh_uppers: wp.array(dtype=wp.vec3f),
+    out_bvh_groups: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    bvh_index_local = tid % num_vertices
+    if bvh_index_local >= num_vertices:
+        return
+
+    vertex_index = bvh_index_local
+
+    world_index = 0
+    # world_index = shape_world_index[vertex_index]
+    # if world_index < 0:
+    #     world_index = num_worlds + world_index
+
+    if world_index >= num_worlds:
+        return
+
+    transform = gsplat_transforms[vertex_index]
+    scale = gsplat_scales[vertex_index]
+
+    lower, upper = compute_ellipsoid_bounds(transform, scale)
+
+    out_bvh_lowers[bvh_index_local] = lower
+    out_bvh_uppers[bvh_index_local] = upper
+    out_bvh_groups[bvh_index_local] = world_index
+
+
+@wp.kernel(enable_backward=False)
 def compute_bvh_group_roots(bvh_id: wp.uint64, out_bvh_group_roots: wp.array(dtype=wp.int32)):
     tid = wp.tid()
     out_bvh_group_roots[tid] = wp.bvh_get_group_root(bvh_id, tid)

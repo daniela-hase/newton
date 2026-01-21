@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import warp as wp
 
-from . import lighting, ray_cast, textures
+from . import gsplat, lighting, ray_cast, textures
 
 if TYPE_CHECKING:
     from .render_context import ClearData, RenderContext
@@ -90,6 +90,7 @@ def _render_megakernel(
     enable_textures: wp.bool,
     enable_ambient_lighting: wp.bool,
     enable_particles: wp.bool,
+    enable_gsplats: wp.bool,
     enable_backface_culling: wp.bool,
     enable_global_world: wp.bool,
     max_distance: wp.float32,
@@ -123,6 +124,15 @@ def _render_megakernel(
     particles_radius: wp.array(dtype=wp.float32),
     # Triangle Mesh:
     triangle_mesh_id: wp.uint64,
+    # GSplat BVH
+    bvh_gsplat_size: wp.int32,
+    bvh_gsplat_id: wp.uint64,
+    bvh_gsplat_group_roots: wp.array(dtype=wp.int32),
+    # GSplat
+    gsplat_transforms: wp.array(dtype=wp.transformf),
+    gsplat_scales: wp.array(dtype=wp.vec3f),
+    gsplat_spherical_harmonics: wp.array(dtype=wp.float32, ndim=2),
+    gsplat_opacities: wp.array(dtype=wp.float32),
     # Materials
     material_texture_ids: wp.array(dtype=wp.int32),
     material_texture_repeat: wp.array(dtype=wp.vec2f),
@@ -193,6 +203,27 @@ def _render_megakernel(
         ray_dir_world,
     )
 
+    out_color = wp.vec3f(0.0)
+
+    if enable_gsplats:
+        gsplat_shade = gsplat.shade(
+            bvh_gsplat_size,
+            bvh_gsplat_id,
+            bvh_gsplat_group_roots,
+            gsplat_transforms,
+            gsplat_scales,
+            gsplat_spherical_harmonics,
+            gsplat_opacities,
+            world_index,
+            enable_global_world,
+            max_distance,
+            ray_origin_world,
+            ray_dir_world,
+        )
+        if gsplat_shade.hit:
+            closest_hit.shape_index = gsplat.GSPLAT_SHAPE_ID
+            out_color = gsplat_shade.color
+
     if closest_hit.shape_index == ray_cast.NO_HIT_SHAPE_ID:
         return
 
@@ -208,98 +239,98 @@ def _render_megakernel(
     if not render_color:
         return
 
-    # Shade the pixel
-    hit_point = ray_origin_world + ray_dir_world * closest_hit.distance
+    if closest_hit.shape_index != gsplat.GSPLAT_SHAPE_ID:
+        # Shade the pixel
+        hit_point = ray_origin_world + ray_dir_world * closest_hit.distance
 
-    color = wp.vec4f(1.0)
-    if closest_hit.shape_index < ray_cast.MAX_SHAPE_ID:
-        color = shape_colors[closest_hit.shape_index]
-        if shape_materials[closest_hit.shape_index] > -1:
-            color = wp.cw_mul(color, material_rgba[shape_materials[closest_hit.shape_index]])
+        color = wp.vec4f(1.0)
+        if closest_hit.shape_index < ray_cast.MAX_SHAPE_ID:
+            color = shape_colors[closest_hit.shape_index]
+            if shape_materials[closest_hit.shape_index] > -1:
+                color = wp.cw_mul(color, material_rgba[shape_materials[closest_hit.shape_index]])
 
-    base_color = wp.vec3f(color[0], color[1], color[2])
-    out_color = wp.vec3f(0.0)
+        base_color = wp.vec3f(color[0], color[1], color[2])
 
-    if enable_textures and closest_hit.shape_index < ray_cast.MAX_SHAPE_ID:
-        material_index = shape_materials[closest_hit.shape_index]
-        if material_index > -1:
-            texture_index = material_texture_ids[material_index]
-            if texture_index > -1:
-                tex_color = textures.sample_texture(
-                    shape_types[closest_hit.shape_index],
-                    shape_transforms[closest_hit.shape_index],
-                    material_index,
-                    texture_index,
-                    material_texture_repeat[material_index],
-                    texture_offsets[texture_index],
-                    texture_data,
-                    texture_height[texture_index],
-                    texture_width[texture_index],
-                    mesh_face_offsets,
-                    mesh_face_vertices,
-                    mesh_texcoord,
-                    mesh_texcoord_offsets,
-                    hit_point,
-                    closest_hit.bary_u,
-                    closest_hit.bary_v,
-                    closest_hit.face_idx,
-                    closest_hit.shape_mesh_index,
-                )
+        if enable_textures and closest_hit.shape_index < ray_cast.MAX_SHAPE_ID:
+            material_index = shape_materials[closest_hit.shape_index]
+            if material_index > -1:
+                texture_index = material_texture_ids[material_index]
+                if texture_index > -1:
+                    tex_color = textures.sample_texture(
+                        shape_types[closest_hit.shape_index],
+                        shape_transforms[closest_hit.shape_index],
+                        material_index,
+                        texture_index,
+                        material_texture_repeat[material_index],
+                        texture_offsets[texture_index],
+                        texture_data,
+                        texture_height[texture_index],
+                        texture_width[texture_index],
+                        mesh_face_offsets,
+                        mesh_face_vertices,
+                        mesh_texcoord,
+                        mesh_texcoord_offsets,
+                        hit_point,
+                        closest_hit.bary_u,
+                        closest_hit.bary_v,
+                        closest_hit.face_idx,
+                        closest_hit.shape_mesh_index,
+                    )
 
-                base_color = wp.vec3f(
-                    base_color[0] * tex_color[0],
-                    base_color[1] * tex_color[1],
-                    base_color[2] * tex_color[2],
-                )
+                    base_color = wp.vec3f(
+                        base_color[0] * tex_color[0],
+                        base_color[1] * tex_color[1],
+                        base_color[2] * tex_color[2],
+                    )
 
-    if enable_ambient_lighting:
-        up = wp.vec3f(0.0, 0.0, 1.0)
-        len_n = wp.length(closest_hit.normal)
-        n = closest_hit.normal if len_n > 0.0 else up
-        n = wp.normalize(n)
-        hemispheric = 0.5 * (wp.dot(n, up) + 1.0)
-        sky = wp.vec3f(0.4, 0.4, 0.45)
-        ground = wp.vec3f(0.1, 0.1, 0.12)
-        ambient_color = sky * hemispheric + ground * (1.0 - hemispheric)
-        ambient_intensity = 0.5
-        out_color = wp.vec3f(
-            base_color[0] * (ambient_color[0] * ambient_intensity),
-            base_color[1] * (ambient_color[1] * ambient_intensity),
-            base_color[2] * (ambient_color[2] * ambient_intensity),
-        )
+        if enable_ambient_lighting:
+            up = wp.vec3f(0.0, 0.0, 1.0)
+            len_n = wp.length(closest_hit.normal)
+            n = closest_hit.normal if len_n > 0.0 else up
+            n = wp.normalize(n)
+            hemispheric = 0.5 * (wp.dot(n, up) + 1.0)
+            sky = wp.vec3f(0.4, 0.4, 0.45)
+            ground = wp.vec3f(0.1, 0.1, 0.12)
+            ambient_color = sky * hemispheric + ground * (1.0 - hemispheric)
+            ambient_intensity = 0.5
+            out_color = wp.vec3f(
+                base_color[0] * (ambient_color[0] * ambient_intensity),
+                base_color[1] * (ambient_color[1] * ambient_intensity),
+                base_color[2] * (ambient_color[2] * ambient_intensity),
+            )
 
-    # Apply lighting and shadows
-    for light_index in range(num_lights):
-        light_contribution = lighting.compute_lighting(
-            enable_shadows,
-            enable_particles,
-            enable_backface_culling,
-            world_index,
-            enable_global_world,
-            bvh_shapes_size,
-            bvh_shapes_id,
-            bvh_shapes_group_roots,
-            bvh_particles_size,
-            bvh_particles_id,
-            bvh_particles_group_roots,
-            shape_enabled,
-            shape_types,
-            shape_mesh_indices,
-            shape_sizes,
-            shape_transforms,
-            mesh_ids,
-            light_active[light_index],
-            light_type[light_index],
-            light_cast_shadow[light_index],
-            light_positions[light_index],
-            light_orientations[light_index],
-            particles_position,
-            particles_radius,
-            triangle_mesh_id,
-            closest_hit.normal,
-            hit_point,
-        )
-        out_color = out_color + base_color * light_contribution
+        # Apply lighting and shadows
+        for light_index in range(num_lights):
+            light_contribution = lighting.compute_lighting(
+                enable_shadows,
+                enable_particles,
+                enable_backface_culling,
+                world_index,
+                enable_global_world,
+                bvh_shapes_size,
+                bvh_shapes_id,
+                bvh_shapes_group_roots,
+                bvh_particles_size,
+                bvh_particles_id,
+                bvh_particles_group_roots,
+                shape_enabled,
+                shape_types,
+                shape_mesh_indices,
+                shape_sizes,
+                shape_transforms,
+                mesh_ids,
+                light_active[light_index],
+                light_type[light_index],
+                light_cast_shadow[light_index],
+                light_positions[light_index],
+                light_orientations[light_index],
+                particles_position,
+                particles_radius,
+                triangle_mesh_id,
+                closest_hit.normal,
+                hit_point,
+            )
+            out_color = out_color + base_color * light_contribution
 
     out_color = wp.min(wp.max(out_color, wp.vec3f(0.0)), wp.vec3f(1.0))
 
@@ -353,6 +384,7 @@ def render_megakernel(
             rc.options.enable_textures,
             rc.options.enable_ambient_lighting,
             rc.options.enable_particles and rc.has_particles,
+            rc.options.enable_gsplats and rc.has_gsplat,
             rc.options.enable_backface_culling,
             rc.options.enable_global_world,
             rc.options.max_distance,
@@ -386,6 +418,15 @@ def render_megakernel(
             rc.particles_radius,
             # Triangle Mesh
             rc.triangle_mesh.id if rc.triangle_mesh is not None else 0,
+            # GSplat BVH
+            rc.num_gsplat_vertices,
+            rc.bvh_gsplat.id if rc.bvh_gsplat else 0,
+            rc.bvh_gsplat_group_roots,
+            # GSplat
+            rc.gsplat_transforms,
+            rc.gsplat_scales,
+            rc.gsplat_spherical_harmonics,
+            rc.gsplat_opacities,
             # Textures
             rc.material_texture_ids,
             rc.material_texture_repeat,

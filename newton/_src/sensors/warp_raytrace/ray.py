@@ -301,6 +301,18 @@ def ray_ellipsoid_with_normal(
 
 
 @wp.func
+def ray_ellipsoid_with_normal(
+    transform: wp.transformf, size: wp.vec3f, ray_origin_world: wp.vec3f, ray_direction_world: wp.vec3f
+) -> tuple[wp.bool, wp.float32, wp.vec3f]:
+    """Returns distance and normal at which a ray intersects with a ellipsoid."""
+    t_hit = ray_ellipsoid(transform, size, ray_origin_world, ray_direction_world)
+    if t_hit == wp.inf:
+        return False, wp.inf, wp.vec3f(0.0, 0.0, 0.0)
+    normal = wp.normalize(ray_origin_world + t_hit * ray_direction_world - wp.transform_get_translation(transform))
+    return True, t_hit, normal
+
+
+@wp.func
 def ray_cylinder(
     transform: wp.transformf, size: wp.vec3f, ray_origin_world: wp.vec3f, ray_direction_world: wp.vec3f
 ) -> tuple[wp.float32, wp.int32]:

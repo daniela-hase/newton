@@ -21,6 +21,7 @@ import warp as wp
 
 from .bvh import (
     compute_bvh_group_roots,
+    compute_gsplat_bvh_bounds,
     compute_particle_bvh_bounds,
     compute_shape_bvh_bounds,
 )
@@ -47,6 +48,7 @@ class RenderContext:
         enable_shadows: bool = True
         enable_ambient_lighting: bool = True
         enable_particles: bool = True
+        enable_gsplats: bool = True
         enable_backface_culling: bool = True
         tile_rendering: bool = False
         tile_size: int = 8
@@ -69,6 +71,7 @@ class RenderContext:
 
         self.bvh_shapes: wp.Bvh = None
         self.bvh_particles: wp.Bvh = None
+        self.bvh_gsplat: wp.Bvh = None
         self.triangle_mesh: wp.Mesh = None
         self.num_shapes_enabled = 0
         self.num_shapes_total = 0
@@ -86,6 +89,11 @@ class RenderContext:
         self.__particles_position: wp.array(dtype=wp.vec3f) = None
         self.__particles_radius: wp.array(dtype=wp.float32) = None
         self.__particles_world_index: wp.array(dtype=wp.int32) = None
+
+        self.gsplat_transforms: wp.array(dtype=wp.transformf) = None
+        self.gsplat_scales: wp.array(dtype=wp.vec3f) = None
+        self.gsplat_spherical_harmonics: wp.array(dtype=wp.float32, ndim=2) = None
+        self.gsplat_opacities: wp.array(dtype=wp.float32) = None
 
         self.shape_enabled: wp.array(dtype=wp.uint32) = None
         self.shape_types: wp.array(dtype=wp.int32) = None
@@ -121,6 +129,10 @@ class RenderContext:
         self.bvh_particles_uppers: wp.array(dtype=wp.vec3f) = None
         self.bvh_particles_groups: wp.array(dtype=wp.int32) = None
         self.bvh_particles_group_roots: wp.array(dtype=wp.int32) = None
+        self.bvh_gsplat_lowers: wp.array(dtype=wp.vec3f) = None
+        self.bvh_gsplat_uppers: wp.array(dtype=wp.vec3f) = None
+        self.bvh_gsplat_groups: wp.array(dtype=wp.int32) = None
+        self.bvh_gsplat_group_roots: wp.array(dtype=wp.int32) = None
 
     def __init_shape_outputs(self):
         if self.bvh_shapes_lowers is None:
@@ -141,6 +153,16 @@ class RenderContext:
             self.bvh_particles_groups = wp.zeros(self.num_particles_total, dtype=wp.int32)
         if self.bvh_particles_group_roots is None:
             self.bvh_particles_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32)
+
+    def __init_gsplat_outputs(self):
+        if self.bvh_gsplat_lowers is None:
+            self.bvh_gsplat_lowers = wp.zeros(self.num_gsplat_vertices, dtype=wp.vec3f)
+        if self.bvh_gsplat_uppers is None:
+            self.bvh_gsplat_uppers = wp.zeros(self.num_gsplat_vertices, dtype=wp.vec3f)
+        if self.bvh_gsplat_groups is None:
+            self.bvh_gsplat_groups = wp.zeros(self.num_gsplat_vertices, dtype=wp.int32)
+        if self.bvh_gsplat_group_roots is None:
+            self.bvh_gsplat_group_roots = wp.zeros((self.num_worlds_total), dtype=wp.int32)
 
     def create_color_image_output(self):
         return wp.zeros((self.num_worlds, self.num_cameras, self.width * self.height), dtype=wp.uint32)
@@ -185,6 +207,23 @@ class RenderContext:
             else:
                 self.bvh_particles.refit()
 
+        if self.num_gsplat_vertices:
+            self.__init_gsplat_outputs()
+            self.__compute_bvh_gsplat_bounds()
+            if self.bvh_gsplat is None:
+                self.bvh_gsplat = wp.Bvh(
+                    self.bvh_gsplat_lowers,
+                    self.bvh_gsplat_uppers,
+                    groups=self.bvh_gsplat_groups,
+                )
+                wp.launch(
+                    kernel=compute_bvh_group_roots,
+                    dim=self.num_worlds_total,
+                    inputs=[self.bvh_gsplat.id, self.bvh_gsplat_group_roots],
+                )
+            else:
+                self.bvh_gsplat.refit()
+
         if self.has_triangle_mesh:
             if self.triangle_mesh is None:
                 self.triangle_mesh = wp.Mesh(self.triangle_points, self.triangle_indices)
@@ -202,7 +241,7 @@ class RenderContext:
         refit_bvh: bool = True,
         clear_data: ClearData | None = DEFAULT_CLEAR_DATA,
     ):
-        if self.has_shapes or self.has_particles or self.has_triangle_mesh:
+        if self.has_shapes or self.has_particles or self.has_triangle_mesh or self.has_gsplat:
             if refit_bvh:
                 self.refit_bvh()
             render_megakernel(
@@ -252,6 +291,22 @@ class RenderContext:
             ],
         )
 
+    def __compute_bvh_gsplat_bounds(self):
+        wp.launch(
+            kernel=compute_gsplat_bvh_bounds,
+            dim=self.num_gsplat_vertices,
+            inputs=[
+                self.num_gsplat_vertices,
+                self.num_worlds_total,
+                # self.particles_world_index,
+                self.gsplat_transforms,
+                self.gsplat_scales,
+                self.bvh_gsplat_lowers,
+                self.bvh_gsplat_uppers,
+                self.bvh_gsplat_groups,
+            ],
+        )
+
     @property
     def num_worlds_total(self) -> int:
         if self.options.enable_global_world:
@@ -271,6 +326,12 @@ class RenderContext:
         return 0
 
     @property
+    def num_gsplat_vertices(self) -> int:
+        if self.gsplat_transforms is not None:
+            return self.gsplat_transforms.shape[0]
+        return 0
+
+    @property
     def has_shapes(self) -> bool:
         return self.num_shapes_enabled > 0
 
@@ -281,6 +342,10 @@ class RenderContext:
     @property
     def has_triangle_mesh(self) -> bool:
         return self.triangle_points is not None
+
+    @property
+    def has_gsplat(self) -> bool:
+        return self.gsplat_transforms is not None
 
     @property
     def triangle_points(self) -> wp.array(dtype=wp.vec3f):
