@@ -26,6 +26,7 @@ from .bvh import (
     compute_shape_bvh_bounds,
 )
 from .render import render_megakernel
+from .types import RenderOrder
 from .utils import Utils
 
 
@@ -50,8 +51,9 @@ class RenderContext:
         enable_particles: bool = True
         enable_gsplats: bool = True
         enable_backface_culling: bool = True
-        tile_rendering: bool = False
-        tile_size: int = 8
+        render_order: int = RenderOrder.PIXEL_PRIORITY
+        tile_width: int = 16
+        tile_height: int = 8
         max_distance: float = 1000.0
 
     def __init__(
