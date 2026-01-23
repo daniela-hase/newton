@@ -254,8 +254,8 @@ def shade(
             num_hits = wp.int32(0)
             max_num_hits = 20
 
-            hit_distances = wp.types.vector(max_distance, length=max_num_hits, dtype=wp.float32)
-            hit_indices = wp.types.vector(-1, length=max_num_hits, dtype=wp.int32)
+            hit_distances = wp.vector(max_distance, length=max_num_hits, dtype=wp.float32)
+            hit_indices = wp.vector(-1, length=max_num_hits, dtype=wp.int32)
 
             while wp.bvh_query_next(query, hit_index, hit_distances[-1]):
                 near_hit, far_hit = ray_gsplat(gsplat_transforms[hit_index], gsplat_scales[hit_index], ray_origin_world, ray_dir_world)
