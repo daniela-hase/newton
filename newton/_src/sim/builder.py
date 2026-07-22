@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import warp as wp
 
+from ..core.cameras import CameraPinhole, CameraProjection
 from ..core.types import (
     MAXVAL,
     Axis,
@@ -43,6 +44,7 @@ from ..geometry import (
     compute_shape_radius,
     transform_inertia,
 )
+from ..geometry.flags import CameraFlags
 from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
 from ..geometry.types import Heightfield
 from ..geometry.utils import RemeshingMethod, compute_inertia_obb, remesh_mesh
@@ -890,6 +892,9 @@ class ModelBuilder:
         self.default_joint_cfg = ModelBuilder.JointDofConfig()
         """Default joint DoF configuration used when joint DoF configuration is omitted."""
 
+        self.default_camera_projection: CameraProjection = CameraPinhole.from_fov(math.radians(45.0))
+        """Projection used by :meth:`add_camera` when none is given."""
+
         self.default_particle_radius = 0.1
         """Default particle radius used when particle radius is not provided explicitly."""
 
@@ -1049,6 +1054,24 @@ class ModelBuilder:
         """Optional contact attributes requested via :meth:`request_contact_attributes`."""
         self._requested_state_attributes: set[str] = set()
         """Optional state attributes requested via :meth:`request_state_attributes`."""
+
+        # cameras
+        self.camera_label: list[str] = []
+        """Camera labels accumulated for :attr:`Model.camera_label`."""
+        self.camera_transform: list[Transform] = []
+        """Camera-to-parent transforms accumulated for :attr:`Model.camera_transform`."""
+        self.camera_body: list[int] = []
+        """Parent body indices accumulated for :attr:`Model.camera_body`."""
+        self.camera_world: list[int] = []
+        """World indices accumulated for :attr:`Model.camera_world`."""
+        self.camera_projection: list = []
+        """Per-camera projection descriptors, deduplicated into :attr:`Model.camera_projections` at finalize."""
+        self.camera_resolution: list[tuple[int, int]] = []
+        """Per-camera resolution hints (width, height) [px]; (-1, -1) when unset."""
+        self.camera_flags: list[int] = []
+        """Camera flags accumulated for :attr:`Model.camera_flags`."""
+        self.camera_world_start: list[int] = []
+        """Per-world camera starts accumulated for :attr:`Model.camera_world_start`."""
 
         # springs
         self.spring_indices: list[int] = []
@@ -2288,6 +2311,11 @@ class ModelBuilder:
         return len(self.articulation_start)
 
     @property
+    def camera_count(self):
+        """Number of cameras in the model (before finalization)."""
+        return len(self.camera_transform)
+
+    @property
     def joint_target_pos(self) -> list[float]:
         """Deprecated alias for :attr:`joint_target_q` (DOF-shape).
 
@@ -2787,6 +2815,7 @@ class ModelBuilder:
         force_position_velocity_actuation: bool = False,
         convert_mjc_equality_constraints: bool = True,
         override_root_xform: bool = False,
+        load_cameras: bool = True,
     ) -> dict[str, Any]:
         """Parses a Universal Scene Description (USD) stage and adds rigid bodies, soft bodies, shapes, and joints to the given ModelBuilder.
 
@@ -2915,6 +2944,12 @@ class ModelBuilder:
                 :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
                 damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
                 (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
+            load_cameras: If True (default), traverse the stage for :class:`UsdGeom.Camera` prims
+                with a perspective projection and import each as a
+                :class:`~newton.CameraPinhole` via :meth:`ModelBuilder.add_camera`.
+                Orthographic cameras emit a :class:`UserWarning` and are skipped.
+                The result dict gains a ``"path_camera_map"`` entry mapping prim path to
+                camera index. Set to False to skip all camera prims.
 
         Returns:
             The returned mapping has the following entries:
@@ -2956,6 +2991,8 @@ class ModelBuilder:
                   - Mapping from prim path to original body index before ``collapse_fixed_joints``
                 * - ``"actuator_count"``
                   - Number of external actuators parsed from the USD stage
+                * - ``"path_camera_map"``
+                  - Mapping from prim path (str) of a :class:`UsdGeom.Camera` prim to its camera index in :class:`~newton.ModelBuilder`. Always present; empty when ``load_cameras=False`` or no perspective cameras were found.
         """
         from ..utils.import_usd import parse_usd  # noqa: PLC0415
 
@@ -2988,6 +3025,7 @@ class ModelBuilder:
             force_position_velocity_actuation=force_position_velocity_actuation,
             convert_mjc_equality_constraints=convert_mjc_equality_constraints,
             override_root_xform=override_root_xform,
+            load_cameras=load_cameras,
         )
 
     def add_mjcf(
@@ -3138,6 +3176,11 @@ class ModelBuilder:
                 actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET` mode where control comes
                 from :attr:`newton.Control.joint_target_q` and :attr:`newton.Control.joint_target_qd`.
             path_resolver: Callback to resolve file paths. Takes (base_dir, file_path) and returns a resolved path. For <include> elements, can return either a file path or XML content directly. For asset elements (mesh, texture, etc.), must return an absolute file path. The default resolver joins paths and returns absolute file paths.
+
+        Note:
+            Non-fixed camera modes (e.g. ``trackcom``, ``targetbody``) are imported as fixed
+            cameras; the original mode string is preserved in the ``mjcf:camera_mode`` custom
+            attribute so downstream code can apply tracking logic.
         """
         from ..solvers.mujoco.solver_mujoco import SolverMuJoCo  # noqa: PLC0415
         from ..utils.import_mjcf import parse_mjcf  # noqa: PLC0415
@@ -3405,6 +3448,7 @@ class ModelBuilder:
         start_triangle_idx = self.tri_count
         start_tetrahedron_idx = self.tet_count
         start_spring_idx = self.spring_count
+        start_camera_idx = self.camera_count
 
         if builder.particle_count:
             self.particle_max_velocity = builder.particle_max_velocity
@@ -3674,6 +3718,7 @@ class ModelBuilder:
             "triangle": start_triangle_idx,
             "tetrahedron": start_tetrahedron_idx,
             "spring": start_spring_idx,
+            "camera": start_camera_idx,
         }
 
         # Snapshot custom frequency counts BEFORE iteration (they get updated during merge)
@@ -3886,6 +3931,29 @@ class ModelBuilder:
             entry.controller_args.extend(sub_entry.controller_args)
             entry.delay_args.extend(sub_entry.delay_args)
             entry.clamping_args.extend(sub_entry.clamping_args)
+
+        # Cameras: remap parent body indices and apply the world offset transform to
+        # world-fixed cameras (mirrors the shape handling above).
+        if builder.camera_count:
+            for c in range(builder.camera_count):
+                b = builder.camera_body[c]
+                if b > -1:
+                    self.camera_body.append(b + start_body_idx)
+                    self.camera_transform.append(builder.camera_transform[c])
+                else:
+                    self.camera_body.append(-1)
+                    if xform is not None:
+                        self.camera_transform.append(transform_mul(xform, builder.camera_transform[c]))
+                    else:
+                        self.camera_transform.append(builder.camera_transform[c])
+                self.camera_world.append(self.current_world)
+                self.camera_projection.append(builder.camera_projection[c])
+                self.camera_resolution.append(builder.camera_resolution[c])
+                self.camera_flags.append(builder.camera_flags[c])
+                label = builder.camera_label[c]
+                if label_prefix and label:
+                    label = f"{label_prefix}/{label}"
+                self.camera_label.append(label)
 
     @staticmethod
     def _coerce_mat33(value: Any) -> wp.mat33:
@@ -6910,6 +6978,80 @@ class ModelBuilder:
             label=label,
             custom_attributes=custom_attributes,
         )
+
+    def add_camera(
+        self,
+        body: int = -1,
+        *,
+        xform: Transform | None = None,
+        projection: CameraProjection | None = None,
+        resolution: tuple[int, int] | None = None,
+        enabled: bool = True,
+        label: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Adds a camera to the model.
+
+        Cameras are first-class entities with world semantics: rays are
+        generated at render time from ``projection`` (see
+        :class:`~newton.CameraProjection`); cameras never store per-pixel data
+        on the model. Camera space is -Z forward, +Y up.
+
+        Args:
+            body: Index of the rigid body the camera is attached to. Use -1
+                for world-fixed cameras. A body-attached camera must be added
+                in the same world context as its body.
+            xform: Transform of the camera in the parent body's local frame
+                (world frame when ``body`` is -1). If ``None``, the identity
+                transform is used.
+            projection: Projection descriptor. If ``None``, uses
+                :attr:`default_camera_projection`. Cameras with equal
+                projections share the deduplicated descriptor after
+                :meth:`finalize`.
+            resolution: Optional preferred image resolution (width, height)
+                [px]. A renderer-side resolution always takes precedence.
+            enabled: If ``True``, sets :attr:`~newton.CameraFlags.ENABLED`.
+            label: Optional label for identifying the camera. If ``None``,
+                ``"camera_{index}"`` is used.
+            custom_attributes: Dictionary of custom attribute names to values
+                (frequency :attr:`~newton.Model.AttributeFrequency.CAMERA`).
+
+        Returns:
+            Index of the newly added camera.
+        """
+        if body < -1 or body >= self.body_count:
+            raise ValueError(f"Invalid body index {body} for camera (body_count={self.body_count})")
+        if body >= 0 and self.body_world[body] != self.current_world:
+            raise ValueError(
+                f"Cannot create camera: body {body} belongs to world {self.body_world[body]}, "
+                f"but current world is {self.current_world}"
+            )
+        camera = self.camera_count
+        if xform is None:
+            xform = wp.transform()
+        else:
+            xform = wp.transform(*xform)
+        if projection is None:
+            projection = self.default_camera_projection
+        if not isinstance(projection, CameraProjection):
+            raise TypeError(f"projection must be a CameraProjection, got {type(projection).__name__}")
+        flags = int(CameraFlags.VISIBLE)
+        if enabled:
+            flags |= int(CameraFlags.ENABLED)
+        self.camera_label.append(label or f"camera_{camera}")
+        self.camera_transform.append(xform)
+        self.camera_body.append(body)
+        self.camera_world.append(self.current_world)
+        self.camera_projection.append(projection)
+        self.camera_resolution.append(tuple(int(v) for v in resolution) if resolution is not None else (-1, -1))
+        self.camera_flags.append(flags)
+        if custom_attributes:
+            self._process_custom_attributes(
+                entity_index=camera,
+                custom_attrs=custom_attributes,
+                expected_frequency=Model.AttributeFrequency.CAMERA,
+            )
+        return camera
 
     def approximate_meshes(
         self,
@@ -10305,6 +10447,7 @@ class ModelBuilder:
                 self._eq_list("equality_constraint_world"),
                 "equality constraint",
             ),
+            (self.camera_world_start, self.camera_count, self.camera_world, "camera"),
         ]
 
         def build_entity_start_array(
@@ -11421,6 +11564,30 @@ class ModelBuilder:
             m.joint_dof_world_start = wp.array(self.joint_dof_world_start, dtype=wp.int32)
             m.joint_coord_world_start = wp.array(self.joint_coord_world_start, dtype=wp.int32)
             m.joint_constraint_world_start = wp.array(self.joint_constraint_world_start, dtype=wp.int32)
+            m.camera_world_start = wp.array(self.camera_world_start, dtype=wp.int32)
+
+            # ---------------------
+            # cameras
+            projections: list = []
+            projection_index: list[int] = []
+            for proj in self.camera_projection:
+                try:
+                    idx = projections.index(proj)
+                except ValueError:
+                    idx = len(projections)
+                    projections.append(proj)
+                projection_index.append(idx)
+            m.camera_label = list(self.camera_label)
+            m.camera_transform = wp.array(self.camera_transform, dtype=wp.transform, requires_grad=requires_grad)
+            m.camera_body = wp.array(self.camera_body, dtype=wp.int32)
+            m.camera_world = wp.array(self.camera_world, dtype=wp.int32)
+            m.camera_flags = wp.array(self.camera_flags, dtype=wp.int32)
+            m.camera_projection_index = wp.array(projection_index, dtype=wp.int32)
+            m.camera_projections = projections
+            if self.camera_count > 0:
+                m.camera_resolution = wp.array([list(r) for r in self.camera_resolution], dtype=wp.int32, ndim=2)
+            else:
+                m.camera_resolution = wp.zeros((0, 2), dtype=wp.int32)
 
             # ---------------------
             # counts
@@ -11431,6 +11598,7 @@ class ModelBuilder:
             m.particle_count = len(self.particle_q)
             m.body_count = self.body_count
             m.shape_count = len(self.shape_type)
+            m.camera_count = self.camera_count
             m.tri_count = len(self.tri_poses)
             m.tet_count = len(self.tet_poses)
             m.edge_count = len(self.edge_rest_angle)
@@ -11606,6 +11774,8 @@ class ModelBuilder:
                     count = m.tet_count
                 elif freq_key == Model.AttributeFrequency.SPRING:
                     count = m.spring_count
+                elif freq_key == Model.AttributeFrequency.CAMERA:
+                    count = m.camera_count
                 else:
                     continue
 

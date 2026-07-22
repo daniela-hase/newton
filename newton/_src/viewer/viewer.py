@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import os
 import sys
 from abc import ABC, abstractmethod
@@ -558,6 +559,11 @@ class ViewerBase(ABC):
         layer.show_hydro_contact_surface = False
         layer.sdf_margin_mode: ViewerBase.SDFMarginMode = ViewerBase.SDFMarginMode.OFF
 
+        # Camera frustum visualization
+        layer.show_cameras = False
+        layer.camera_frustum_depth: float = 0.5
+        layer._camera_frustums = None
+
         layer.gaussians_max_points = 100_000  # Max number of points to visualize per gaussian
 
         # Hydroelastic contact surface line cache
@@ -771,6 +777,59 @@ class ViewerBase(ABC):
         """
         return
 
+    def set_camera_from_model(self, camera: int | str, state: newton.State | None = None):
+        """Positions the viewport camera at a model camera's current pose.
+
+        Args:
+            camera: Camera index or label (see :attr:`~newton.Model.camera_label`).
+            state: Optional state used to resolve body-attached camera poses;
+                falls back to the last logged state, then to model rest poses.
+
+        Raises:
+            KeyError: If ``camera`` is a string label not present in the model.
+        """
+        if self.model is None or self.model.camera_count == 0:
+            return
+        if isinstance(camera, str):
+            try:
+                index = self.model.camera_label.index(camera)
+            except ValueError:
+                raise KeyError(f"No camera labeled {camera!r}") from None
+        else:
+            index = int(camera)
+        from ..core.cameras import xform_to_pitch_yaw  # noqa: PLC0415
+
+        # Compose this one camera's world transform live, reading only its own
+        # rows via slicing rather than materializing every camera's transform --
+        # this matters when a scene holds hundreds of cameras.
+        resolved_state = state if state is not None else getattr(self, "_last_state", None)
+        cam_xf = wp.transform(*self.model.camera_transform[index : index + 1].numpy()[0])
+        body = int(self.model.camera_body[index : index + 1].numpy()[0])
+        if body >= 0:
+            if resolved_state is not None and resolved_state.body_q is not None:
+                body_q = resolved_state.body_q
+            else:
+                body_q = self.model.body_q
+            xf = wp.transform(*body_q[body : body + 1].numpy()[0]) * cam_xf
+        else:
+            xf = cam_xf
+        world = int(self.model.camera_world[index : index + 1].numpy()[0])
+        if self.world_offsets is not None and 0 <= world < self.world_offsets.shape[0]:
+            offset = self.world_offsets[world : world + 1].numpy()[0]
+            xf = wp.transform(
+                wp.vec3(xf.p[0] + offset[0], xf.p[1] + offset[1], xf.p[2] + offset[2]),
+                xf.q,
+            )
+        pos, pitch, yaw = xform_to_pitch_yaw(xf, int(self.model.up_axis))
+        self.set_camera(wp.vec3(*pos), pitch, yaw)
+        # Adopt the camera fov when the viewer exposes a viewport camera.
+        proj_index = int(self.model.camera_projection_index[index : index + 1].numpy()[0])
+        proj = self.model.camera_projections[proj_index]
+        viewport_camera = getattr(self, "camera", None)
+        if viewport_camera is not None and hasattr(proj, "fov"):
+            # viewport Camera.fov is in degrees; projection fov is in radians
+            viewport_camera.fov = math.degrees(proj.fov)
+
     def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3):
         """Set world offsets for visual separation of multiple worlds.
 
@@ -980,6 +1039,24 @@ class ViewerBase(ABC):
 
         self._log_gaussian_shapes(state)
         self._log_non_shape_state(state)
+
+        if self.show_cameras and self.model.camera_count:
+            if (
+                self._camera_frustums is None
+                or self._camera_frustums.model is not self.model
+                or self._camera_frustums.depth != self.camera_frustum_depth
+            ):
+                from .camera_frustums import CameraFrustums  # noqa: PLC0415
+
+                self._camera_frustums = CameraFrustums(self.model, depth=self.camera_frustum_depth)
+            self._camera_frustums.update(state, self.world_offsets)
+            self.log_lines(
+                "model/cameras",
+                self._camera_frustums.starts,
+                self._camera_frustums.ends,
+                (0.9, 0.8, 0.1),
+            )
+
         self.model_changed = False
 
     def _sync_shape_colors_from_model(self):

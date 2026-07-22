@@ -36,7 +36,21 @@ class ShapeFlags(IntEnum):
     """Indicates that the shape uses hydroelastic collision."""
 
 
+# Camera flags
+class CameraFlags(IntEnum):
+    """
+    Flags for camera properties.
+    """
+
+    ENABLED = 1 << 0
+    """Indicates that the camera is available for rendering by camera sensors."""
+
+    VISIBLE = 1 << 1
+    """Indicates that the camera frustum may be drawn by viewers."""
+
+
 __all__ = [
+    "CameraFlags",
     "ParticleFlags",
     "ShapeFlags",
 ]

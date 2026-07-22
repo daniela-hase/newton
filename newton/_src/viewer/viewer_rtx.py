@@ -29,6 +29,7 @@ import warp as wp
 
 import newton
 
+from ..core.cameras import fov_to_focal_length
 from ..core.types import Axis, override
 
 try:
@@ -483,7 +484,7 @@ void main() {
         # camera.fov is vertical FOV, so derive focal length from the vertical aperture.
         v_aperture = 20.955
         h_aperture = v_aperture * aspect
-        focal_length = v_aperture / (2.0 * math.tan(math.radians(self.camera.fov) / 2.0))
+        focal_length = fov_to_focal_length(math.radians(self.camera.fov), v_aperture)
 
         cam.GetFocalLengthAttr().Set(focal_length)
         cam.GetHorizontalApertureAttr().Set(h_aperture)
@@ -1394,6 +1395,8 @@ void main() {
             self._init_ovrtx()
 
         with wp.ScopedTimer("ViewerRTX::end_frame", active=PROFILE_ENABLED, use_nvtx=True):
+            if self.gui:
+                self.gui.apply_camera_follow()
             self._update_ovrtx_camera()
             self._update_ovrtx_transforms()
             self._update_ovrtx_instance_visibility()

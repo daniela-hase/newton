@@ -28,6 +28,13 @@ newton
 
    Axis
    BodyFlags
+   CameraCustomRays
+   CameraFisheyeFTheta
+   CameraFisheyeKannalaBrandt
+   CameraFisheyeOpenCV
+   CameraFlags
+   CameraPinhole
+   CameraProjection
    CollisionPipeline
    Contacts
    Control
