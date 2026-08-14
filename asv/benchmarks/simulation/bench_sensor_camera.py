@@ -284,11 +284,13 @@ class _SensorCameraSceneRig:
         self.sensor.render_config.enable_shadows = True
         self.sensor.render_config.enable_textures = True
 
-        self.render_context = newton.RenderContext(self.model)
-        self.render_context.create_default_light(enable_shadows=True, direction=light_direction)
-        self.render_context.assign_checkerboard_material(
-            shape_indices=np.arange(self.model.shape_count, dtype=np.int32)
-        )
+        # self.render_context = newton.RenderContext(self.model)
+        # self.render_context.create_default_light(enable_shadows=True, direction=light_direction)
+        # self.render_context.assign_checkerboard_material(
+        #     shape_indices=np.arange(self.model.shape_count, dtype=np.int32)
+        # )
+        from vulkan_renderer import RenderContext as VulkanRenderContext
+        self.render_context = VulkanRenderContext(self.model)
         self.sensor.render_context = self.render_context
         self.sensor.finalize()
 
