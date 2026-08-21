@@ -269,12 +269,13 @@ class Example:
             sensor_camera.render_config.enable_textures = True
             sensor_camera.clear_data = newton.ClearData(clear_color=0xFF666666, clear_albedo=0xFF000000)
 
-        # self.render_context = newton.RenderContext(self.model)
-        # self.render_context.create_default_light(enable_shadows=True)
-        # self.render_context.assign_checkerboard_material(shape_indices=self.ground_shape_indices)
-
-        from vulkan_renderer import RenderContext as VulkanRenderContext
-        self.render_context = VulkanRenderContext(self.model)
+        if args.vulkan:
+            from vulkan_renderer import NewtonAdapter
+            self.render_context = NewtonAdapter(self.model)
+        else:
+            self.render_context = newton.RenderContext(self.model)
+            self.render_context.create_default_light(enable_shadows=True)
+            self.render_context.assign_checkerboard_material(shape_indices=self.ground_shape_indices)
 
         self.sensor_camera.render_context = self.render_context
         self.robot_sensor_camera.render_context = self.render_context
@@ -570,6 +571,10 @@ class Example:
         parser.add_argument(
             "--ply",
             help="Gaussian filename.",
+        )
+        parser.add_argument(
+            "--vulkan",
+            action="store_true",
         )
         parser.add_argument(
             "-min",

@@ -96,6 +96,7 @@ _MANY_SHAPES_COLORS = (
     (0.93, 0.40, 0.47),
 )
 
+USE_VULKAN_RENDERER = False
 
 def _set_joint_positions(builder: newton.ModelBuilder, joint_positions: dict[str, float]) -> None:
     """Set initial positions of single-DOF joints by joint name.
@@ -284,13 +285,17 @@ class _SensorCameraSceneRig:
         self.sensor.render_config.enable_shadows = True
         self.sensor.render_config.enable_textures = True
 
-        # self.render_context = newton.RenderContext(self.model)
-        # self.render_context.create_default_light(enable_shadows=True, direction=light_direction)
-        # self.render_context.assign_checkerboard_material(
-        #     shape_indices=np.arange(self.model.shape_count, dtype=np.int32)
-        # )
-        from vulkan_renderer import RenderContext as VulkanRenderContext
-        self.render_context = VulkanRenderContext(self.model)
+        print(f"USE_VULKAN_RENDERER: {USE_VULKAN_RENDERER}")
+        if USE_VULKAN_RENDERER:
+            from vulkan_renderer import NewtonAdapter
+            self.render_context = NewtonAdapter(self.model)
+        else:
+            self.render_context = newton.RenderContext(self.model)
+            self.render_context.create_default_light(enable_shadows=True, direction=light_direction)
+            # self.render_context.assign_checkerboard_material(
+            #     shape_indices=np.arange(self.model.shape_count, dtype=np.int32)
+            # )
+        
         self.sensor.render_context = self.render_context
         self.sensor.finalize()
 
@@ -449,7 +454,13 @@ if __name__ == "__main__":
         default=1024,
         help="Preview image width and height [px].",
     )
+    parser.add_argument(
+        "--vulkan",
+        action="store_true"
+    )
     args = parser.parse_known_args()[0]
+
+    USE_VULKAN_RENDERER = args.vulkan
 
     if args.preview:
         for path in write_preview_images(sorted(SCENES), args.preview_dir, image_size=args.preview_size):
