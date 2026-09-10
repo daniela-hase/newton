@@ -80,8 +80,46 @@ class RenderConfig:
     enable_shadows: bool = False
     """Enable shadow rays for directional lights."""
 
-    enable_ambient_lighting: bool = True
-    """Enable ambient lighting for the scene."""
+    enable_dome_lighting: bool = True
+    """Enable dome lighting for the ambient term.
+
+    Uses the HDRI set via :meth:`~newton.sensors.SensorCamera.set_dome_light`
+    if one was provided, otherwise falls back to a built-in two-tone sky/ground
+    gradient. Set to ``False`` to disable ambient shading entirely.
+    """
+
+    dome_shadow_samples: int = 0
+    """Shadow-ray samples for HDRI dome lighting (soft shadows / directional occlusion).
+
+    ``0`` uses the fast unshadowed spherical-harmonic irradiance. A value ``N > 0``
+    casts ``N`` shadow rays per pixel, importance-sampled toward the bright parts
+    of the environment (e.g. the sun), and accumulates the radiance from the
+    unoccluded directions. Occluders therefore cast soft shadows from concentrated
+    sources as well as diffuse sky, without the fireflies that uniform sampling
+    produces. Directions are drawn stochastically with a per-pixel, per-frame seed:
+    the estimate is unbiased and converges under temporal accumulation, but each
+    frame carries Monte-Carlo noise that varies frame to frame. Raise ``N`` to
+    reduce it. Only used when :attr:`enable_dome_lighting` is set.
+    """
+
+    dome_shadow_max_distance: float = 0.0
+    """Maximum length [m] of dome shadow rays; ``0`` uses :attr:`max_distance`.
+
+    Dome occlusion is usually local (contact/ambient shadows), so capping the
+    shadow-ray length lets the BVH traversal terminate early and skips distant
+    geometry, which can substantially speed up rendering on open scenes. Smaller
+    values are faster but ignore occluders beyond the cap. Only used when
+    :attr:`dome_shadow_samples` > 0.
+    """
+
+    enable_dome_background: bool = False
+    """Show the HDRI dome environment map as the background for camera rays that miss all geometry.
+
+    Requires an environment set via
+    :meth:`~newton.sensors.SensorCamera.set_dome_light`; the built-in sky/ground
+    ambient has no per-direction image to display. Only used when
+    :attr:`enable_dome_lighting` is set.
+    """
 
     enable_particles: bool = True
     """Enable standalone particle rendering.
@@ -168,3 +206,37 @@ class TextureData:
 
     texture: wp.Texture2D
     repeat: wp.vec2f
+
+
+@wp.struct
+class DomeLight:
+    """HDRI dome (environment) lighting data for diffuse ambient and shadowed sampling.
+
+    See :func:`~newton._src.sensors.sensor_camera_render.dome.compute_dome_sh9` and
+    :func:`~newton._src.sensors.sensor_camera_render.dome.equirect_frame` for how
+    ``spherical_harmonics``/``forward``/``bitangent``/``up`` are derived, and
+    :func:`~newton._src.sensors.sensor_camera_render.dome.sample_env` for how
+    ``environment_map``/``row_cumulative_distribution``/``column_cumulative_distribution``/
+    ``probability_density_scale`` are consumed.
+
+    Attributes:
+        spherical_harmonics: Order-2 diffuse-irradiance SH coefficients, shape ``[9]``, dtype ``vec3f``.
+        intensity: Scalar multiplier applied to the dome contribution.
+        environment_map: Equirectangular radiance map, shape ``[height, width]``, dtype ``vec3f``.
+        forward: Equirectangular basis forward axis (azimuth 0).
+        bitangent: Equirectangular basis bitangent axis (azimuth pi/2).
+        up: Equirectangular basis up axis (the pole).
+        row_cumulative_distribution: Marginal row CDF for importance sampling, shape ``[height]``.
+        column_cumulative_distribution: Per-row conditional column CDF, shape ``[height, width]``.
+        probability_density_scale: Scale converting sampled luminance to a solid-angle pdf.
+    """
+
+    spherical_harmonics: wp.array[wp.vec3f]
+    intensity: wp.float32
+    environment_map: wp.array2d[wp.vec3f]
+    forward: wp.vec3f
+    bitangent: wp.vec3f
+    up: wp.vec3f
+    row_cumulative_distribution: wp.array[wp.float32]
+    column_cumulative_distribution: wp.array2d[wp.float32]
+    probability_density_scale: wp.float32

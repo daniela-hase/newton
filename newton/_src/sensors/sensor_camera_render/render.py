@@ -9,8 +9,9 @@ import warp as wp
 
 from ...geometry import Gaussian, GeoType
 from ...utils.color import ColorSpace, color_srgb_to_linear, linear_to_srgb_wp, srgb_to_linear_wp
+from . import dome as dome_lighting
 from . import lighting, raytrace, textures, tiling
-from .types import ClearData, MeshData, RenderConfig, RenderOrder, TextureData, WorldRenderFlag
+from .types import ClearData, DomeLight, MeshData, RenderConfig, RenderOrder, TextureData, WorldRenderFlag
 
 if TYPE_CHECKING:
     from .render_context import RenderContext
@@ -31,6 +32,7 @@ def _srgb_packed_rgba_to_linear(packed: int) -> int:
 def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_data: ClearData) -> wp.kernel:
     compute_lighting = lighting.create_compute_lighting_function(config, state)
     sample_texture = textures.create_sample_texture_function(config)
+    sample_dome_shadow = dome_lighting.create_sample_dome_shadow_function(config, state)
 
     if (
         state.render_color
@@ -128,6 +130,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         light_cast_shadow: wp.array[wp.bool],
         light_positions: wp.array[wp.vec3f],
         light_orientations: wp.array[wp.vec3f],
+        # Dome Lighting
+        dome: DomeLight,
+        dome_shadow_seed: wp.int32,
+        dome_shadow_sample_count: wp.int32,
         # Outputs
         out_color: wp.array[wp.uint32],
         out_depth: wp.array[wp.float32],
@@ -236,6 +242,16 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 out_albedo,
                 out_hdr_color,
             )
+            if wp.static(config.enable_dome_lighting and config.enable_dome_background):
+                if wp.static(state.render_color) or wp.static(state.render_hdr_color):
+                    background = dome_lighting.sample_env_direction(dome, wp.normalize(ray_dir_world)) * dome.intensity
+                    if wp.static(state.render_hdr_color):
+                        out_hdr_color[out_index] = background
+                    if wp.static(state.render_color):
+                        packed_background = background
+                        if wp.static(config.output_color_space == ColorSpace.SRGB):
+                            packed_background = linear_to_srgb_wp(packed_background)
+                        out_color[out_index] = tiling.pack_rgba_to_uint32(packed_background, 1.0)
             return
 
         if wp.static(state.render_depth):
@@ -305,18 +321,65 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         shaded_color = closest_hit.color
 
         if not is_gaussian:
-            if wp.static(config.enable_ambient_lighting):
+            if wp.static(config.enable_dome_lighting):
                 up = wp.vec3f(0.0, 0.0, 1.0)
                 len_n = wp.length(closest_hit.normal)
-                n = closest_hit.normal if len_n > 0.0 else up
-                n = wp.normalize(n)
-                hemispheric = 0.5 * (wp.dot(n, up) + 1.0)
-                sky = wp.vec3f(0.4, 0.4, 0.45)
-                ground = wp.vec3f(0.1, 0.1, 0.12)
-                ambient_color = sky * hemispheric + ground * (1.0 - hemispheric)
-                ambient_intensity = 0.5
-
-                shaded_color = wp.cw_mul(albedo_color, ambient_color * ambient_intensity)
+                n = wp.normalize(closest_hit.normal if len_n > 0.0 else up)
+                if wp.static(config.dome_shadow_samples > 0):
+                    # Shadowed dome by Monte-Carlo integration of the *visible*
+                    # environment, importance-sampled by radiance x solid angle: rays
+                    # are aimed at bright directions (e.g. the sun) via the precomputed
+                    # CDFs, then weighted by 1/pdf. This both lets an occluder cast a
+                    # shadow from a high-frequency source and avoids the fireflies /
+                    # darkening that uniform sampling produces for concentrated light.
+                    # Sampling is stochastic with a per-pixel, per-frame seed: unbiased
+                    # and convergent under temporal accumulation, with per-frame noise
+                    # that drops as dome_shadow_samples grows.
+                    shadow_origin = hit_point + n * 1.0e-4
+                    rng = wp.rand_init(dome_shadow_seed, out_index)
+                    inv_count = 1.0 / float(dome_shadow_sample_count)
+                    radiance_sum = wp.vec3f(0.0)
+                    # A runtime (non-compile-time-constant) loop bound: keeps the Warp
+                    # compiler from unrolling this loop, which for certain sample
+                    # counts produced a corrupted kernel (illegal memory access at
+                    # launch). See
+                    # :func:`~newton._src.sensors.sensor_camera_render.dome.create_sample_dome_shadow_function`.
+                    for s in range(dome_shadow_sample_count):
+                        # Stratify the marginal (row) dimension so the samples spread
+                        # evenly across the environment's brightness distribution
+                        # instead of clustering, lowering variance for the same ray
+                        # count (fewer rays needed for equal quality).
+                        radiance_sum = radiance_sum + sample_dome_shadow(
+                            dome,
+                            bvh_shapes_size,
+                            bvh_shapes_id,
+                            bvh_shapes_group_roots,
+                            bvh_particles_size,
+                            bvh_particles_id,
+                            bvh_particles_group_roots,
+                            world_index,
+                            shape_enabled,
+                            shape_types,
+                            shape_sizes,
+                            shape_transforms,
+                            shape_source_ptr,
+                            particles_position,
+                            particles_radius,
+                            topology_particle_mask,
+                            triangle_mesh_id,
+                            triangle_mesh_group_roots,
+                            shadow_origin,
+                            n,
+                            (float(s) + wp.randf(rng)) * inv_count,
+                            wp.randf(rng),
+                            wp.randf(rng),
+                            wp.randf(rng),
+                        )
+                    dome_factor = radiance_sum * inv_count
+                    shaded_color = wp.cw_mul(albedo_color, dome_factor * dome.intensity)
+                else:
+                    irradiance = dome_lighting.eval_dome_irradiance(dome, n)
+                    shaded_color = wp.cw_mul(albedo_color, irradiance * dome.intensity)
 
             # Apply lighting and shadows
             for light_index in range(light_count):

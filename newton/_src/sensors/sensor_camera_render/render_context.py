@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import warp as wp
@@ -12,9 +13,10 @@ import warp as wp
 from ...core import Axis
 from ...geometry import GeoType, Mesh
 from ...sim import Model, State
-from ...utils import load_texture, normalize_texture
+from ...utils import load_equirect_image, load_texture, normalize_texture
+from .dome import compute_dome_sh9, default_ambient_sh, equirect_frame
 from .render import create_kernel
-from .types import ClearData, LightType, MeshData, RenderConfig, RenderOrder, TextureData
+from .types import ClearData, DomeLight, LightType, MeshData, RenderConfig, RenderOrder, TextureData
 
 
 class RenderContext:
@@ -82,6 +84,10 @@ class RenderContext:
         self._lights_cast_shadow: wp.array[wp.bool] | None = None
         self._lights_position: wp.array[wp.vec3f] | None = None
         self._lights_orientation: wp.array[wp.vec3f] | None = None
+
+        self._dome_light = self._create_default_dome_light()
+        self._dome_light_set: bool = False
+        self._frame_index: int = 0
 
         # Heightfields are triangulated meshes (their wp.Mesh lives in
         # shape_source_ptr), so the renderer treats them as meshes: it reuses
@@ -179,6 +185,84 @@ class RenderContext:
             dtype=wp.vec3f,
             device=self.device,
         )
+
+    def _create_default_dome_light(self) -> DomeLight:
+        """Build the built-in two-tone sky/ground ambient dome light.
+
+        Active whenever :attr:`RenderConfig.enable_dome_lighting` is set and no
+        HDRI has been provided via :meth:`set_dome_light`. Only the SH term is
+        populated; the environment map / CDFs needed for shadowed sampling are
+        left empty (see the ``RuntimeError`` in :meth:`render`).
+        """
+        forward, bitangent, up = equirect_frame(self.up_axis)
+        dome_light = DomeLight()
+        dome_light.spherical_harmonics = wp.array(default_ambient_sh(self.up_axis), dtype=wp.vec3f, device=self.device)
+        dome_light.intensity = 1.0
+        dome_light.forward = wp.vec3f(float(forward[0]), float(forward[1]), float(forward[2]))
+        dome_light.bitangent = wp.vec3f(float(bitangent[0]), float(bitangent[1]), float(bitangent[2]))
+        dome_light.up = wp.vec3f(float(up[0]), float(up[1]), float(up[2]))
+        dome_light.probability_density_scale = 1.0
+        return dome_light
+
+    def set_dome_light(
+        self,
+        image: Any,
+        *,
+        intensity: float = 1.0,
+        rotation: float = 0.0,
+    ) -> None:
+        """Set an HDRI dome light providing diffuse image-based ambient lighting.
+
+        Projects the equirectangular environment onto order-2 spherical
+        harmonics (:func:`~newton._src.sensors.sensor_camera_render.dome.compute_dome_sh9`);
+        rendering uses it for the ambient term when
+        :attr:`~newton.sensors.SensorCamera.RenderConfig.enable_dome_lighting` is
+        set, replacing the built-in sky/ground ambient. Also enables the
+        shadowed dome path (:attr:`~newton.sensors.SensorCamera.RenderConfig.dome_shadow_samples`).
+
+        Args:
+            image: Equirectangular environment. A linear-radiance array
+                ``(H, W, C>=3)``, a Warp array, or a path to a ``.hdr`` image or
+                an LDR image.
+            intensity: Scalar multiplier applied to the dome contribution.
+            rotation: Azimuth offset [rad] about the scene up axis (yaw).
+        """
+        equirect = load_equirect_image(image)
+        if equirect is None:
+            raise ValueError(f"Failed to load dome light image: {image!r}")
+        spherical_harmonics = compute_dome_sh9(equirect, self.up_axis, rotation)
+        forward, bitangent, up = equirect_frame(self.up_axis, rotation)
+        self._dome_light.spherical_harmonics = wp.array(spherical_harmonics, dtype=wp.vec3f, device=self.device)
+        self._dome_light.intensity = float(intensity)
+        self._dome_light.environment_map = wp.array(equirect, dtype=wp.vec3f, device=self.device)
+        self._dome_light.forward = wp.vec3f(float(forward[0]), float(forward[1]), float(forward[2]))
+        self._dome_light.bitangent = wp.vec3f(float(bitangent[0]), float(bitangent[1]), float(bitangent[2]))
+        self._dome_light.up = wp.vec3f(float(up[0]), float(up[1]), float(up[2]))
+
+        # Build the importance-sampling distribution over the environment, weighted
+        # by luminance and solid angle (``sin(theta)``): a marginal cumulative
+        # distribution over rows and a per-row conditional cumulative distribution
+        # over columns. Shadow rays sampled from this aim at bright directions
+        # (e.g. the sun), avoiding the fireflies and darkening that uniform/cosine
+        # sampling causes for concentrated sources.
+        luminance = np.maximum(equirect[:, :, :3].astype(np.float64) @ (0.2126, 0.7152, 0.0722), 1.0e-8)
+        env_height, env_width = luminance.shape
+        thetas = (np.arange(env_height) + 0.5) / env_height * np.pi
+        weight = luminance * np.sin(thetas)[:, None]
+        total_weight = float(weight.sum())
+        row_weight = weight.sum(axis=1)
+        row_cumulative_distribution = np.cumsum(row_weight) / total_weight
+        row_cumulative_distribution[-1] = 1.0
+        column_cumulative_distribution = np.cumsum(weight, axis=1) / row_weight[:, None]
+        column_cumulative_distribution[:, -1] = 1.0
+        self._dome_light.row_cumulative_distribution = wp.array(
+            row_cumulative_distribution, dtype=wp.float32, device=self.device
+        )
+        self._dome_light.column_cumulative_distribution = wp.array(
+            column_cumulative_distribution, dtype=wp.float32, device=self.device
+        )
+        self._dome_light.probability_density_scale = (env_width * env_height) / (total_weight * 2.0 * np.pi * np.pi)
+        self._dome_light_set = True
 
     def assign_checkerboard_material(
         self,
@@ -290,6 +374,14 @@ class RenderContext:
         if config is None:
             config = RenderContext.DEFAULT_RENDER_CONFIG
 
+        if config.enable_dome_lighting and config.dome_shadow_samples > 0 and not self._dome_light_set:
+            raise RuntimeError("dome_shadow_samples > 0 requires an environment map; call set_dome_light() first.")
+
+        if config.enable_dome_lighting and config.enable_dome_background and not self._dome_light_set:
+            raise RuntimeError("enable_dome_background requires an environment map; call set_dome_light() first.")
+
+        self._frame_index += 1
+
         if model.shape_count > 0 and model.bvh_shape_enabled is None:
             raise RuntimeError(
                 "Shape BVH is missing. ModelBuilder.finalize() builds it for finalized models; "
@@ -380,14 +472,23 @@ class RenderContext:
             if hdr_color_image is not None:
                 hdr_color_image = hdr_color_image.reshape(total_pixels)
 
+            # dome_shadow_samples only affects codegen through its truthiness
+            # (config.dome_shadow_samples > 0); the actual count is a runtime kernel
+            # argument (dome_shadow_sample_count above). Normalize it before keying
+            # the cache so every positive sample count shares one compiled kernel
+            # instead of triggering a recompile per distinct value.
+            kernel_config = config if config.dome_shadow_samples <= 1 else replace(config, dome_shadow_samples=1)
+
             # Key the cache on the value tuple itself (dict hashes AND compares by
             # equality), so two configs that merely share a hash cannot collide onto
             # one kernel. Store snapshots on insert since config/state/clear_data are
             # mutable (``unsafe_hash``); a later mutation must not alter a stored key.
-            render_kernel = self._kernel_cache.get((config, self._render_state, clear_data))
+            render_kernel = self._kernel_cache.get((kernel_config, self._render_state, clear_data))
             if render_kernel is None:
-                render_kernel = create_kernel(config, self._render_state, clear_data)
-                self._kernel_cache[(replace(config), replace(self._render_state), replace(clear_data))] = render_kernel
+                render_kernel = create_kernel(kernel_config, self._render_state, clear_data)
+                self._kernel_cache[(replace(kernel_config), replace(self._render_state), replace(clear_data))] = (
+                    render_kernel
+                )
 
             particle_count = state.particle_q.shape[0] if has_particles else 0
 
@@ -446,6 +547,10 @@ class RenderContext:
                     self._lights_cast_shadow,
                     self._lights_position,
                     self._lights_orientation,
+                    # Dome Lighting
+                    self._dome_light,
+                    self._frame_index,
+                    config.dome_shadow_samples,
                     # Outputs
                     color_image,
                     depth_image,

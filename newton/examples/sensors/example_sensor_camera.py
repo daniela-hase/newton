@@ -256,11 +256,15 @@ class Example:
         self.sensor_camera = SensorCamera(self.model)
         self.robot_sensor_camera = SensorCamera(self.model)
         for sensor_camera in (self.sensor_camera, self.robot_sensor_camera):
-            sensor_camera.create_default_light(enable_shadows=True)
+            # sensor_camera.create_default_light(enable_shadows=True)
+            if args.dome_hdri:
+                sensor_camera.set_dome_light(args.dome_hdri, intensity=args.dome_intensity)
+                sensor_camera.default_render_config.dome_shadow_samples = args.dome_shadow_samples
             sensor_camera.assign_checkerboard_material(shape_indices=self.ground_shape_indices)
             sensor_camera.default_render_config.enable_shadows = True
             sensor_camera.default_render_config.enable_textures = True
             sensor_camera.default_clear_data = SensorCamera.ClearData(clear_color=0xFF666666, clear_albedo=0xFF000000)
+        self._dome_light_available = bool(args.dome_hdri)
 
         # The caller owns the camera-space rays and the per-view world-space camera
         # transforms passed to SensorCamera.update(); the observer camera is world-
@@ -544,6 +548,13 @@ class Example:
             self.robot_sensor_camera if self.show_robot_camera else self.sensor_camera
         ).default_render_config
 
+        if self._dome_light_available:
+            changed, render_config.enable_dome_background = ui.checkbox(
+                "Dome Background", render_config.enable_dome_background
+            )
+            if changed:
+                show_compile_kernel_info = True
+
         if ui.radio_button(
             "Gaussians: Fast",
             render_config.gaussians_mode == SensorCamera.GaussianRenderMode.FAST,
@@ -614,6 +625,23 @@ class Example:
         parser.add_argument(
             "--ply",
             help="Gaussian filename.",
+        )
+        parser.add_argument(
+            "--dome-hdri",
+            help="Path to an equirectangular .hdr environment for HDRI dome lighting "
+            "(diffuse image-based ambient). Omit to use the fixed hemispheric ambient.",
+        )
+        parser.add_argument(
+            "--dome-intensity",
+            type=float,
+            default=1.0,
+            help="HDRI dome brightness multiplier (lower it so the key light's shadow is not washed out).",
+        )
+        parser.add_argument(
+            "--dome-shadow-samples",
+            type=int,
+            default=0,
+            help="Shadow rays per pixel for HDRI dome soft shadows (0 disables; requires --dome-hdri).",
         )
         parser.add_argument(
             "-min",

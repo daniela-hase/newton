@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 import numpy as np
+import warp as wp
 
 _texture_url_cache: dict[str, bytes] = {}
 
@@ -134,6 +135,145 @@ def load_texture(texture: str | os.PathLike[str] | np.ndarray | None) -> np.ndar
         return np.ascontiguousarray(loaded)
 
     return np.ascontiguousarray(np.asarray(texture))
+
+
+def _decode_hdr_rgbe(data: bytes) -> np.ndarray:
+    """Decode Radiance RGBE (``.hdr``) bytes into a linear float RGB image.
+
+    Supports the ``32-bit_rle_rgbe`` format with flat scanlines and the
+    new-style adaptive run-length encoding (the encodings emitted by virtually
+    all modern HDRI authoring tools). Old-style run-length encoding is not
+    handled.
+
+    Args:
+        data: Raw file contents of a Radiance ``.hdr`` image.
+
+    Returns:
+        Linear radiance image, shape ``(H, W, 3)`` float32, first row at the
+        ``+up`` pole.
+    """
+    scan = np.frombuffer(data, dtype=np.uint8)
+
+    def readline(start: int) -> tuple[bytes, int]:
+        end = data.index(b"\n", start)
+        return data[start:end], end + 1
+
+    line, idx = readline(0)
+    if not line.startswith(b"#?"):
+        raise ValueError("not a Radiance HDR file")
+    while True:  # header ends at the first blank line
+        line, idx = readline(idx)
+        if line.strip() == b"":
+            break
+
+    res_line, idx = readline(idx)
+    tokens = res_line.split()
+    # Normative resolution line is "-Y H +X W" (Y major/rows, X minor/cols).
+    if len(tokens) != 4 or tokens[0][1:2] not in (b"Y", b"y"):
+        raise ValueError(f"unsupported HDR resolution line: {res_line!r}")
+    height, width = int(tokens[1]), int(tokens[3])
+    flip_y = tokens[0][:1] == b"+"  # +Y stores scanlines bottom-to-top
+    flip_x = tokens[2][:1] == b"-"
+
+    rgbe = np.empty((height, width, 4), dtype=np.uint8)
+    ptr = idx
+    for y in range(height):
+        is_new_rle = (
+            8 <= width <= 0x7FFF
+            and scan[ptr] == 2
+            and scan[ptr + 1] == 2
+            and ((int(scan[ptr + 2]) << 8) | int(scan[ptr + 3])) == width
+        )
+        if is_new_rle:
+            ptr += 4
+            for channel in range(4):  # channels stored as separate RLE streams
+                x = 0
+                while x < width:
+                    count = int(scan[ptr])
+                    ptr += 1
+                    if count > 128:  # run of a single value
+                        run = count - 128
+                        rgbe[y, x : x + run, channel] = scan[ptr]
+                        ptr += 1
+                    else:  # literal span
+                        run = count
+                        rgbe[y, x : x + run, channel] = scan[ptr : ptr + run]
+                        ptr += run
+                    x += run
+        else:  # flat scanline: width RGBE quadruples
+            rgbe[y] = scan[ptr : ptr + width * 4].reshape(width, 4)
+            ptr += width * 4
+
+    exponent = rgbe[..., 3].astype(np.int32)
+    scale = np.where(exponent > 0, np.ldexp(1.0, exponent - (128 + 8)), 0.0).astype(np.float32)
+    rgb = rgbe[..., :3].astype(np.float32) * scale[..., None]
+
+    if flip_y:
+        rgb = rgb[::-1]
+    if flip_x:
+        rgb = rgb[:, ::-1]
+    return np.ascontiguousarray(rgb, dtype=np.float32)
+
+
+def load_hdr_image(path: str | os.PathLike[str]) -> np.ndarray | None:
+    """Load a Radiance ``.hdr`` (RGBE) image into a linear float RGB array.
+
+    Uses a dependency-free pure-numpy decoder (see :func:`_decode_hdr_rgbe`).
+
+    Args:
+        path: Filesystem path to a Radiance ``.hdr`` image.
+
+    Returns:
+        Linear radiance image, shape ``(H, W, 3)`` float32, or ``None`` if the
+        file cannot be read or decoded.
+    """
+    path = os.fspath(path)
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        return _decode_hdr_rgbe(data)
+    except Exception as exc:
+        warnings.warn(f"Failed to load HDR image: {path} ({exc})", stacklevel=2)
+        return None
+
+
+def load_equirect_image(image: str | os.PathLike[str] | np.ndarray | wp.array | None) -> np.ndarray | None:
+    """Normalize an equirectangular environment image to linear float RGB.
+
+    Args:
+        image: Linear-radiance array ``(H, W, C>=3)`` (float arrays are treated
+            as linear; integer arrays as sRGB and converted to linear), a Warp
+            array, or a path to a ``.hdr`` image or an LDR image loadable by
+            :func:`load_texture`.
+
+    Returns:
+        Linear RGB image, shape ``(H, W, 3)`` float32, or ``None`` if unavailable.
+    """
+    if image is None:
+        return None
+
+    if isinstance(image, wp.array):
+        image = image.numpy()
+
+    if isinstance(image, np.ndarray):
+        arr = np.asarray(image)
+        if np.issubdtype(arr.dtype, np.integer):
+            rgb = arr[..., :3].astype(np.float32) / float(np.iinfo(arr.dtype).max)
+            rgb = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        else:
+            rgb = arr[..., :3].astype(np.float32)
+        return np.ascontiguousarray(rgb, dtype=np.float32)
+
+    path = os.fspath(image)
+    if os.path.splitext(path)[1].lower() == ".hdr":
+        return load_hdr_image(path)
+
+    ldr = load_texture(path)  # uint8 sRGB RGBA
+    if ldr is None:
+        return None
+    rgb = ldr[..., :3].astype(np.float32) / 255.0
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return np.ascontiguousarray(linear, dtype=np.float32)
 
 
 def linear_texture_to_srgb(texture_image: np.ndarray | None) -> np.ndarray | None:

@@ -458,6 +458,53 @@ class SensorCamera:
         """
         self._get_render_context().create_default_light(enable_shadows=enable_shadows, direction=direction)
 
+    def set_dome_light(self, image: Any, *, intensity: float = 1.0, rotation: float = 0.0) -> None:
+        """Set an HDRI dome light for diffuse image-based lighting.
+
+        The equirectangular environment supplies the scene's diffuse ambient
+        term via order-2 spherical harmonics, replacing the built-in sky/ground
+        ambient. Directional and spot lights created via
+        :meth:`create_default_light` still contribute on top.
+
+        The dome is unshadowed by default. Set
+        :attr:`~newton.sensors.SensorCamera.RenderConfig.dome_shadow_samples` to
+        ``N > 0`` to cast ``N`` importance-sampled shadow rays per pixel into the
+        environment for (noisy) soft shadows; the Monte-Carlo noise varies each
+        frame and converges under temporal accumulation.
+
+        Set :attr:`~newton.sensors.SensorCamera.RenderConfig.enable_dome_background`
+        to show the environment itself as the background for camera rays that
+        miss all geometry, instead of the render's clear color.
+
+        This enables ``enable_dome_lighting`` on :attr:`default_render_config`.
+        When passing a per-call ``render_config`` to :meth:`update`, set
+        :attr:`~newton.sensors.SensorCamera.RenderConfig.enable_dome_lighting`
+        on it as well.
+
+        Args:
+            image: Equirectangular environment. A linear-radiance array
+                ``(H, W, C>=3)``, a Warp array, or a path to a ``.hdr`` image or
+                an LDR image.
+            intensity: Scalar multiplier applied to the dome contribution.
+            rotation: Azimuth offset [rad] about the scene up axis (yaw).
+        """
+        self._get_render_context().set_dome_light(image, intensity=intensity, rotation=rotation)
+        self.default_render_config.enable_dome_lighting = True
+
+    def set_dome_light_color(self, color: tuple[float, float, float], *, intensity: float = 1.0) -> None:
+        """Set a flat, uniform-color dome light for diffuse image-based lighting.
+
+        Convenience wrapper around :meth:`set_dome_light` for a constant
+        environment: since the SH projection of a uniform environment of
+        radiance ``L`` yields ``L`` for every normal, a single-texel image is
+        sufficient and exact (no HDRI file needed).
+
+        Args:
+            color: Linear-radiance RGB of the environment, e.g. ``(0.5, 0.5, 0.5)``.
+            intensity: Scalar multiplier applied to the dome contribution.
+        """
+        self.set_dome_light(np.full((1, 1, 3), color, dtype=np.float32), intensity=intensity)
+
     def assign_checkerboard_material(
         self,
         *,
