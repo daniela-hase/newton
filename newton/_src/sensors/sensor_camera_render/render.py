@@ -9,8 +9,9 @@ import warp as wp
 
 from ...geometry import Gaussian, GeoType
 from ...utils.color import ColorSpace, color_srgb_to_linear, linear_to_srgb_wp, srgb_to_linear_wp
+from . import dome as dome_lighting
 from . import lighting, raytrace, textures, tiling
-from .types import AntiAliasing, ClearData, MeshData, RenderConfig, RenderOrder, TextureData, WorldRenderFlag
+from .types import AntiAliasing, ClearData, DomeLight, MeshData, RenderConfig, RenderOrder, TextureData, WorldRenderFlag
 
 if TYPE_CHECKING:
     from .render_context import RenderContext
@@ -82,6 +83,7 @@ def _unpack_rgba(packed: wp.uint32):
 def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_data: ClearData) -> wp.kernel:
     compute_lighting = lighting.create_compute_lighting_function(config, state)
     sample_texture = textures.create_sample_texture_function(config)
+    sample_dome_shadow = dome_lighting.create_sample_dome_shadow_function(config, state)
 
     if (
         state.render_color
@@ -238,6 +240,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         light_cast_shadow: wp.array[wp.bool],
         light_positions: wp.array[wp.vec3f],
         light_orientations: wp.array[wp.vec3f],
+        dome: DomeLight,
+        dome_shadow_seed: wp.int32,
+        dome_shadow_sample_count: wp.int32,
+        sample_seed: wp.int32,
     ) -> ShadeResult:
         result = ShadeResult()
         result.albedo = wp.vec3f(0.0)
@@ -285,16 +291,65 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
 
         shaded_color = closest_hit.color
         if not is_gaussian:
-            if wp.static(config.enable_ambient_lighting):
+            if wp.static(config.enable_dome_lighting):
                 up = wp.vec3f(0.0, 0.0, 1.0)
                 len_n = wp.length(closest_hit.normal)
-                n = closest_hit.normal if len_n > 0.0 else up
-                n = wp.normalize(n)
-                hemispheric = 0.5 * (wp.dot(n, up) + 1.0)
-                sky = wp.vec3f(0.4, 0.4, 0.45)
-                ground = wp.vec3f(0.1, 0.1, 0.12)
-                ambient_color = sky * hemispheric + ground * (1.0 - hemispheric)
-                shaded_color = wp.cw_mul(albedo_color, ambient_color * 0.5)
+                n = wp.normalize(closest_hit.normal if len_n > 0.0 else up)
+                if wp.static(config.dome_shadow_samples > 0):
+                    # Shadowed dome by Monte-Carlo integration of the *visible*
+                    # environment, importance-sampled by radiance x solid angle: rays
+                    # are aimed at bright directions (e.g. the sun) via the precomputed
+                    # CDFs, then weighted by 1/pdf. This both lets an occluder cast a
+                    # shadow from a high-frequency source and avoids the fireflies /
+                    # darkening that uniform sampling produces for concentrated light.
+                    # Sampling is stochastic with a per-pixel, per-frame seed: unbiased
+                    # and convergent under temporal accumulation, with per-frame noise
+                    # that drops as dome_shadow_samples grows.
+                    shadow_origin = hit_point + n * 1.0e-4
+                    rng = wp.rand_init(dome_shadow_seed, sample_seed)
+                    inv_count = 1.0 / float(dome_shadow_sample_count)
+                    radiance_sum = wp.vec3f(0.0)
+                    # A runtime (non-compile-time-constant) loop bound: keeps the Warp
+                    # compiler from unrolling this loop, which for certain sample
+                    # counts produced a corrupted kernel (illegal memory access at
+                    # launch). See
+                    # :func:`~newton._src.sensors.sensor_camera_render.dome.create_sample_dome_shadow_function`.
+                    for s in range(dome_shadow_sample_count):
+                        # Stratify the marginal (row) dimension so the samples spread
+                        # evenly across the environment's brightness distribution
+                        # instead of clustering, lowering variance for the same ray
+                        # count (fewer rays needed for equal quality).
+                        radiance_sum = radiance_sum + sample_dome_shadow(
+                            dome,
+                            bvh_shapes_size,
+                            bvh_shapes_id,
+                            bvh_shapes_group_roots,
+                            bvh_particles_size,
+                            bvh_particles_id,
+                            bvh_particles_group_roots,
+                            world_index,
+                            shape_enabled,
+                            shape_types,
+                            shape_sizes,
+                            shape_transforms,
+                            shape_source_ptr,
+                            particles_position,
+                            particles_radius,
+                            topology_particle_mask,
+                            triangle_mesh_id,
+                            triangle_mesh_group_roots,
+                            shadow_origin,
+                            n,
+                            (float(s) + wp.randf(rng)) * inv_count,
+                            wp.randf(rng),
+                            wp.randf(rng),
+                            wp.randf(rng),
+                        )
+                    dome_factor = radiance_sum * inv_count
+                    shaded_color = wp.cw_mul(albedo_color, dome_factor * dome.intensity)
+                else:
+                    irradiance = dome_lighting.eval_dome_irradiance(dome, n)
+                    shaded_color = wp.cw_mul(albedo_color, irradiance * dome.intensity)
 
             for light_index in range(light_count):
                 light_contribution = compute_lighting(
@@ -365,6 +420,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         light_cast_shadow: wp.array[wp.bool],
         light_positions: wp.array[wp.vec3f],
         light_orientations: wp.array[wp.vec3f],
+        dome: DomeLight,
+        dome_shadow_seed: wp.int32,
+        dome_shadow_sample_count: wp.int32,
+        sample_seed: wp.int32,
     ) -> RenderSample:
         result = RenderSample()
         result.hit = wp.bool(False)
@@ -450,6 +509,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             light_cast_shadow,
             light_positions,
             light_orientations,
+            dome,
+            dome_shadow_seed,
+            dome_shadow_sample_count,
+            sample_seed,
         )
         result.albedo = shade.albedo
         result.color = shade.color
@@ -504,6 +567,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         light_cast_shadow: wp.array[wp.bool],
         light_positions: wp.array[wp.vec3f],
         light_orientations: wp.array[wp.vec3f],
+        # Dome Lighting
+        dome: DomeLight,
+        dome_shadow_seed: wp.int32,
+        dome_shadow_sample_count: wp.int32,
         # Outputs
         out_color: wp.array[wp.uint32],
         out_depth: wp.array[wp.float32],
@@ -604,6 +671,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 light_cast_shadow,
                 light_positions,
                 light_orientations,
+                dome,
+                dome_shadow_seed,
+                dome_shadow_sample_count,
+                out_index,
             )
             if not sample.hit:
                 write_clear_outputs(
@@ -616,6 +687,18 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     out_albedo,
                     out_hdr_color,
                 )
+                if wp.static(config.enable_dome_lighting and config.enable_dome_background):
+                    ray_dir_world = wp.transform_vector(camera_transform, camera_rays[py, px, 0, 1])
+                    if wp.dot(ray_dir_world, ray_dir_world) > 1.0e-12:
+                        background = (
+                            dome_lighting.sample_env_direction(dome, wp.normalize(ray_dir_world)) * dome.intensity
+                        )
+                        if wp.static(state.render_hdr_color):
+                            out_hdr_color[out_index] = background
+                        if wp.static(state.render_color):
+                            if wp.static(config.output_color_space == ColorSpace.SRGB):
+                                background = linear_to_srgb_wp(background)
+                            out_color[out_index] = tiling.pack_rgba_to_uint32(background, 1.0)
                 return
 
             if wp.static(state.render_depth):
@@ -703,10 +786,24 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     light_cast_shadow,
                     light_positions,
                     light_orientations,
+                    dome,
+                    dome_shadow_seed,
+                    dome_shadow_sample_count,
+                    out_index,
                 )
                 if not sample.hit:
+                    background_color = clear_color
+                    if wp.static(config.enable_dome_lighting and config.enable_dome_background):
+                        ray_dir_world = wp.transform_vector(camera_transform, camera_rays[py, px, sample_index, 1])
+                        if wp.dot(ray_dir_world, ray_dir_world) > 1.0e-12:
+                            background = (
+                                dome_lighting.sample_env_direction(dome, wp.normalize(ray_dir_world)) * dome.intensity
+                            )
+                            background_color = wp.vec4f(background[0], background[1], background[2], 1.0)
+                            if wp.static(state.render_hdr_color):
+                                hdr_color_sum += background
                     if wp.static(state.render_color):
-                        color_sum += clear_color
+                        color_sum += background_color
                     if wp.static(state.render_albedo):
                         albedo_sum += clear_albedo
                     continue
@@ -739,15 +836,16 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     out_albedo,
                     out_hdr_color,
                 )
-                return
+                if wp.static(not (config.enable_dome_lighting and config.enable_dome_background)):
+                    return
 
-            if wp.static(state.render_depth):
+            if has_hit and wp.static(state.render_depth):
                 out_depth[out_index] = nearest_distance
-            if wp.static(state.render_forward_depth):
+            if has_hit and wp.static(state.render_forward_depth):
                 out_forward_depth[out_index] = nearest_forward_depth
-            if wp.static(state.render_normal):
+            if has_hit and wp.static(state.render_normal):
                 out_normal[out_index] = nearest_normal
-            if wp.static(state.render_shape_index):
+            if has_hit and wp.static(state.render_shape_index):
                 out_shape_index[out_index] = nearest_shape_index
 
             sample_scale = 1.0 / float(sample_count)
@@ -776,6 +874,8 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             miss_count = wp.int32(0)
 
             shaded_sum = wp.vec3f(0.0)
+            background_sum = wp.vec4f(0.0)
+            background_hdr_sum = wp.vec3f(0.0)
             albedo_accum = wp.vec3f(0.0)
 
             slot_shape = wp.vector(length=_MSAA_SURFACE_SLOTS, dtype=wp.uint32)
@@ -817,6 +917,18 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 )
                 if not trace.hit:
                     miss_count += 1
+                    background_color = clear_color
+                    if wp.static(config.enable_dome_lighting and config.enable_dome_background):
+                        ray_dir_world = trace.ray_dir_world
+                        if wp.dot(ray_dir_world, ray_dir_world) > 1.0e-12:
+                            background = (
+                                dome_lighting.sample_env_direction(dome, wp.normalize(ray_dir_world)) * dome.intensity
+                            )
+                            background_color = wp.vec4f(background[0], background[1], background[2], 1.0)
+                            if wp.static(state.render_hdr_color):
+                                background_hdr_sum += background
+                    if wp.static(state.render_color):
+                        background_sum += background_color
                     continue
 
                 hit_count += 1
@@ -883,6 +995,10 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                             light_cast_shadow,
                             light_positions,
                             light_orientations,
+                            dome,
+                            dome_shadow_seed,
+                            dome_shadow_sample_count,
+                            out_index,
                         )
                         sample_color = shade.color
                         sample_albedo = shade.albedo
@@ -916,21 +1032,22 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     out_albedo,
                     out_hdr_color,
                 )
-                return
+                if wp.static(not (config.enable_dome_lighting and config.enable_dome_background)):
+                    return
 
-            if wp.static(state.render_depth):
+            if hit_count > 0 and wp.static(state.render_depth):
                 out_depth[out_index] = nearest_distance
-            if wp.static(state.render_forward_depth):
+            if hit_count > 0 and wp.static(state.render_forward_depth):
                 out_forward_depth[out_index] = nearest_forward_depth
-            if wp.static(state.render_normal):
+            if hit_count > 0 and wp.static(state.render_normal):
                 out_normal[out_index] = nearest_normal
-            if wp.static(state.render_shape_index):
+            if hit_count > 0 and wp.static(state.render_shape_index):
                 out_shape_index[out_index] = nearest_shape_index
 
             sample_scale = 1.0 / float(sample_count)
             miss_weight = float(miss_count)
             if wp.static(state.render_hdr_color):
-                out_hdr_color[out_index] = shaded_sum * sample_scale
+                out_hdr_color[out_index] = (shaded_sum + background_hdr_sum) * sample_scale
             if wp.static(state.render_albedo):
                 albedo_rgb = (
                     albedo_accum + wp.vec3f(clear_albedo[0], clear_albedo[1], clear_albedo[2]) * miss_weight
@@ -941,9 +1058,9 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 out_albedo[out_index] = tiling.pack_rgba_to_uint32(albedo_rgb, albedo_alpha)
             if wp.static(state.render_color):
                 color_rgb = (
-                    shaded_sum + wp.vec3f(clear_color[0], clear_color[1], clear_color[2]) * miss_weight
+                    shaded_sum + wp.vec3f(background_sum[0], background_sum[1], background_sum[2])
                 ) * sample_scale
-                color_alpha = (float(hit_count) + clear_color[3] * miss_weight) * sample_scale
+                color_alpha = (float(hit_count) + background_sum[3]) * sample_scale
                 if wp.static(config.output_color_space == ColorSpace.SRGB):
                     color_rgb = linear_to_srgb_wp(color_rgb)
                 out_color[out_index] = tiling.pack_rgba_to_uint32(color_rgb, color_alpha)

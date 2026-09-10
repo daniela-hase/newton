@@ -251,7 +251,10 @@ class Example:
         W = self.sensor_render_width
         H = self.sensor_render_height
         self.sensor_camera = SensorCamera(self.model)
-        self.sensor_camera.create_default_light(enable_shadows=True)
+        if args.dome_hdri:
+            self.sensor_camera.set_dome_light(args.dome_hdri, intensity=args.dome_intensity)
+            self.sensor_camera.default_render_config.dome_shadow_samples = args.dome_shadow_samples
+        self._dome_light_available = bool(args.dome_hdri)
         self.sensor_camera.assign_checkerboard_material(shape_indices=self.ground_shape_indices)
         self.sensor_camera.default_render_config.enable_shadows = True
         self.sensor_camera.default_render_config.enable_textures = True
@@ -536,6 +539,13 @@ class Example:
 
         render_config = self.sensor_camera.default_render_config
 
+        if self._dome_light_available:
+            changed, render_config.enable_dome_background = ui.checkbox(
+                "Dome Background", render_config.enable_dome_background
+            )
+            if changed:
+                show_compile_kernel_info = True
+
         if ui.radio_button(
             "Gaussians: Fast",
             render_config.gaussians_mode == SensorCamera.GaussianRenderMode.FAST,
@@ -606,6 +616,23 @@ class Example:
         parser.add_argument(
             "--ply",
             help="Gaussian filename.",
+        )
+        parser.add_argument(
+            "--dome-hdri",
+            help="Path to an equirectangular .hdr environment for HDRI dome lighting "
+            "(diffuse image-based ambient). Omit to use the fixed hemispheric ambient.",
+        )
+        parser.add_argument(
+            "--dome-intensity",
+            type=float,
+            default=1.0,
+            help="HDRI dome brightness multiplier (lower it so the key light's shadow is not washed out).",
+        )
+        parser.add_argument(
+            "--dome-shadow-samples",
+            type=int,
+            default=0,
+            help="Shadow rays per pixel for HDRI dome soft shadows (0 disables; requires --dome-hdri).",
         )
         parser.add_argument(
             "-min",

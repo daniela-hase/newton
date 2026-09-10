@@ -8,7 +8,7 @@ import warp as wp
 
 from ..core.types import Axis
 from .download_assets import clear_git_cache, download_asset
-from .texture import load_texture, normalize_texture
+from .texture import load_equirect_image, load_hdr_image, load_texture, normalize_texture
 from .topology import topological_sort, topological_sort_undirected
 
 
@@ -120,6 +120,8 @@ __all__ = [
     "compute_world_offsets",
     "download_asset",
     "is_graph_capture_allocation_enabled",
+    "load_equirect_image",
+    "load_hdr_image",
     "load_texture",
     "normalize_texture",
     "topological_sort",
