@@ -116,6 +116,7 @@ class ViewerRTX(ViewerUSD):
     _PICKING_LINE_NAME = "picking_line"
     _PICKING_LINE_RADIUS = 0.01
     _PICKING_LINE_COLOR = (0.0, 1.0, 1.0)
+    _LDR_COLOR_RENDER_VAR_KEYS = ("LdrColor", "/Render/Vars/LdrColor")
 
     # Available lighting environment presets.
     ENVIRONMENTS = ("default", "studio", "none")
@@ -913,6 +914,29 @@ void main() {
 
         self._instance_prim_paths[self._PICKING_LINE_NAME] = [path]
 
+    @staticmethod
+    def _seed_line_display_color(instancer, frame_index: int) -> None:
+        """Author placeholder color data for an initially empty line batch.
+
+        OVRTX only binds the PointInstancer color primvar when it contains a
+        value and index during initial scene ingestion. Without this seed,
+        colors written after an empty first frame render as gray.
+        """
+        from pxr import Vt
+
+        display_color = UsdGeom.PrimvarsAPI(instancer).GetPrimvar("displayColor")
+        if display_color.Get(frame_index) is None:
+            display_color.Set([Gf.Vec3f(0.5, 0.5, 0.5)], frame_index)
+            display_color.SetIndices(Vt.IntArray([0]), frame_index)
+
+    @classmethod
+    def _get_ldr_color_render_var(cls, frame):
+        """Return the LDR color render variable across supported OVRTX key forms."""
+        for key in cls._LDR_COLOR_RENDER_VAR_KEYS:
+            if key in frame.render_vars:
+                return frame.render_vars[key]
+        return None
+
     def _remove_runtime_line_batch_layer(self, name: str):
         if self._rtx is None:
             return
@@ -1583,6 +1607,71 @@ void main() {
                 self._pending_xforms[name] = (xforms, scales)
 
     @override
+    def log_arrows(
+        self,
+        name: str,
+        starts: wp.array[wp.vec3] | None,
+        ends: wp.array[wp.vec3] | None,
+        colors: (wp.array[wp.vec3] | wp.array[wp.float32] | tuple[float, float, float] | list[float] | None),
+        width: float = 0.01,
+        hidden: bool = False,
+    ) -> None:
+        """Log arrow segments (line shaft + a 4-fin arrowhead) for rendering.
+
+        OVRTX has no dedicated arrow primitive and, unlike ``log_lines``,
+        ``log_instances`` batches cannot change size once authored during
+        the initial USD build phase. Since arrow counts vary frame to frame
+        (e.g. active contacts), arrows are instead expanded into a single
+        line batch — a shaft plus a 4-fin arrowhead — reusing the same
+        runtime-rebuildable path as :meth:`log_lines`.
+
+        Args:
+            name: Unique identifier for the arrow batch.
+            starts: Array of arrow start positions [m], shape ``[N, 3]``, or ``None`` for empty.
+            ends: Array of arrow end positions / arrowhead tips [m], shape ``[N, 3]``, or ``None`` for empty.
+            colors: Array of per-arrow RGB colors, a single RGB triplet, or ``None`` for empty.
+            width: Line width [m].
+            hidden: Whether the arrows are initially hidden.
+        """
+        name = self._qualify(name)
+
+        if starts is None or ends is None or colors is None or len(starts) == 0:
+            self.log_lines(name, None, None, None, width=width, hidden=hidden)
+            return
+
+        assert isinstance(starts, wp.array)
+        assert isinstance(ends, wp.array)
+        num_arrows = len(starts)
+        assert len(ends) == num_arrows, "Number of arrow ends must match arrow starts"
+
+        if isinstance(colors, tuple | list):
+            color_vec = wp.vec3(*colors)
+            colors_arr = wp.full(num_arrows, color_vec, dtype=wp.vec3, device=self.device)
+        elif isinstance(colors, wp.array) and colors.dtype == wp.float32:
+            colors_arr = colors.reshape((num_arrows, 3)).view(dtype=wp.vec3)
+        else:
+            colors_arr = colors
+        assert isinstance(colors_arr, wp.array)
+        assert len(colors_arr) == num_arrows, "Number of arrow colors must match arrow starts"
+
+        num_segments = num_arrows * 5
+        line_starts = wp.empty(num_segments, dtype=wp.vec3, device=self.device)
+        line_ends = wp.empty(num_segments, dtype=wp.vec3, device=self.device)
+        line_colors = wp.empty(num_segments, dtype=wp.vec3, device=self.device)
+
+        from .kernels import compute_arrow_lines  # noqa: PLC0415
+
+        wp.launch(
+            kernel=compute_arrow_lines,
+            dim=num_segments,
+            inputs=[starts, ends, colors_arr, 0.3, 0.35],
+            outputs=[line_starts, line_ends, line_colors],
+            device=self.device,
+        )
+
+        self.log_lines(name, line_starts, line_ends, line_colors, width=width, hidden=hidden)
+
+    @override
     def log_lines(
         self,
         name: str,
@@ -1607,6 +1696,8 @@ void main() {
         if self._phase == self._PHASE_BUILD:
             super().log_lines(name, starts, ends, colors, width, hidden)
             self._line_batch_paths[name] = self._get_path(name)
+            instancer = UsdGeom.PointInstancer.Get(self.stage, self._line_batch_paths[name])
+            self._seed_line_display_color(instancer, self._frame_index)
             self._line_batch_proto_paths[name] = self._get_path(name) + "/capsule"
             self._line_batch_widths[name] = float(width)
             return
@@ -1875,25 +1966,13 @@ void main() {
                 if not is_visible:
                     continue
 
-                self._rtx.write_array_attribute(
-                    [prim_path], "positions", [self._make_laned_array_dltensor(positions.astype(np.float32), lanes=3)]
-                )
-                self._rtx.write_array_attribute(
-                    [prim_path],
-                    "orientations",
-                    [self._make_laned_array_dltensor(orientations.astype(np.float16), lanes=4)],
-                )
-                self._rtx.write_array_attribute(
-                    [prim_path], "scales", [self._make_laned_array_dltensor(scales.astype(np.float32), lanes=3)]
-                )
-                self._rtx.write_array_attribute([prim_path], "protoIndices", [proto_indices])
-                self._rtx.write_array_attribute([prim_path], "ids", [ids])
-                self._rtx.write_array_attribute(
-                    [prim_path],
-                    "primvars:displayColor",
-                    [self._make_laned_array_dltensor(colors_np.astype(np.float32), lanes=3)],
-                )
-                self._rtx.write_array_attribute([prim_path], "primvars:displayColor:indices", [color_indices])
+                self._write_ovrtx_array_attribute(prim_path, "positions", positions)
+                self._write_ovrtx_array_attribute(prim_path, "orientations", orientations)
+                self._write_ovrtx_array_attribute(prim_path, "scales", scales)
+                self._write_ovrtx_array_attribute(prim_path, "protoIndices", proto_indices)
+                self._write_ovrtx_array_attribute(prim_path, "ids", ids)
+                self._write_ovrtx_array_attribute(prim_path, "primvars:displayColor", colors_np)
+                self._write_ovrtx_array_attribute(prim_path, "primvars:displayColor:indices", color_indices)
 
     def _update_ovrtx_point_batches(self):
         if self._rtx is None or not self._pending_point_batches:
@@ -1975,9 +2054,10 @@ void main() {
             if self._render_products is not None and self._window is not None and self._window.context is not None:
                 for _pname, product in self._render_products.items():
                     for frame in product.frames:
-                        if "LdrColor" in frame.render_vars:
+                        render_var = self._get_ldr_color_render_var(frame)
+                        if render_var is not None:
                             with wp.ScopedTimer("ViewerRTX::fb_map", active=PROFILE_ENABLED, use_nvtx=True):
-                                with frame.render_vars["LdrColor"].map(device=Device.CUDA) as mapping:
+                                with render_var.map(device=Device.CUDA) as mapping:
                                     pixels = wp.from_dlpack(mapping, dtype=wp.vec4ub)
                                     with wp.ScopedTimer(
                                         "ViewerRTX::blit_to_window", active=PROFILE_ENABLED, use_nvtx=True
@@ -2058,8 +2138,9 @@ void main() {
 
         for _pname, product in products.items():
             for frame in product.frames:
-                if "LdrColor" in frame.render_vars:
-                    with frame.render_vars["LdrColor"].map(device=Device.CPU) as mapping:
+                render_var = self._get_ldr_color_render_var(frame)
+                if render_var is not None:
+                    with render_var.map(device=Device.CPU) as mapping:
                         pixels = np.array(np.from_dlpack(mapping), copy=True)
                     return pixels
 

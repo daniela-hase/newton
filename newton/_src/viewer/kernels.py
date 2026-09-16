@@ -940,6 +940,72 @@ def compute_inertia_box_lines(
     line_colors[tid] = color
 
 
+@wp.kernel
+def compute_arrow_lines(
+    starts: wp.array[wp.vec3],
+    ends: wp.array[wp.vec3],
+    colors: wp.array[wp.vec3],
+    head_length_fraction: float,
+    head_spread_fraction: float,
+    # outputs: 5 segments per arrow (1 shaft + 4 arrowhead fins)
+    line_starts: wp.array[wp.vec3],
+    line_ends: wp.array[wp.vec3],
+    line_colors: wp.array[wp.vec3],
+):
+    """Expand arrows into line segments: a shaft plus a 4-fin arrowhead.
+
+    Used by backends with no dedicated arrow primitive (e.g. ``ViewerRTX``)
+    so arrows remain a single, per-frame-rebuildable line batch — unlike a
+    mesh-instanced arrowhead, this has no fixed prim-count limitation and
+    tolerates arrow counts that vary from frame to frame (e.g. active
+    contacts). The 4 fins fan out around the shaft direction so the
+    arrowhead reads correctly from any viewing angle.
+    """
+    tid = wp.tid()
+    arrow_id = tid // 5
+    seg_id = tid % 5
+
+    start = starts[arrow_id]
+    end = ends[arrow_id]
+    color = colors[arrow_id]
+
+    if seg_id == 0:
+        line_starts[tid] = start
+        line_ends[tid] = end
+        line_colors[tid] = color
+        return
+
+    nan_pt = wp.vec3(wp.nan, wp.nan, wp.nan)
+    delta = end - start
+    length = wp.length(delta)
+
+    if length < 1.0e-6:
+        line_starts[tid] = nan_pt
+        line_ends[tid] = nan_pt
+        line_colors[tid] = color
+        return
+
+    direction = delta / length
+    head_length = length * head_length_fraction
+    base = end - head_length * direction
+
+    t1, t2 = orthonormal_basis(direction)
+    fin_offset = head_length * head_spread_fraction
+
+    if seg_id == 1:
+        fin_point = base + fin_offset * t1
+    elif seg_id == 2:
+        fin_point = base - fin_offset * t1
+    elif seg_id == 3:
+        fin_point = base + fin_offset * t2
+    else:
+        fin_point = base - fin_offset * t2
+
+    line_starts[tid] = end
+    line_ends[tid] = fin_point
+    line_colors[tid] = color
+
+
 @wp.func
 def depth_to_color(depth: float, min_depth: float, max_depth: float) -> wp.vec3:
     """Convert depth value to a color using a blue-to-red colormap."""

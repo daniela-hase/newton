@@ -438,6 +438,90 @@ class TestViewerUSD(unittest.TestCase):
         self.assertIn("opacity", log_mesh_params)
         self.assertIn("opacities", log_instances_params)
 
+    def test_viewer_rtx_seeds_empty_line_display_color(self):
+        """Author color data for a line batch that is initially empty."""
+        viewer = self._make_viewer()
+        viewer.begin_frame(0.0)
+        viewer.log_lines("/empty_lines", None, None, None)
+        instancer = UsdGeom.PointInstancer.Get(viewer.stage, "/root/empty_lines")
+
+        ViewerRTX._seed_line_display_color(instancer, viewer._frame_index)
+
+        display_color = UsdGeom.PrimvarsAPI(instancer).GetPrimvar("displayColor")
+        np.testing.assert_allclose(display_color.Get(viewer._frame_index), ((0.5, 0.5, 0.5),))
+        self.assertEqual(list(display_color.GetIndices(viewer._frame_index)), [0])
+
+    def test_viewer_rtx_preserves_authored_line_display_color(self):
+        """Keep existing build-time line colors when seeding the primvar."""
+        viewer = self._make_viewer()
+        starts = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3)
+        ends = wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3)
+        colors = wp.array([[1.0, 0.0, 0.0]], dtype=wp.vec3)
+        viewer.begin_frame(0.0)
+        viewer.log_lines("/colored_lines", starts, ends, colors)
+        instancer = UsdGeom.PointInstancer.Get(viewer.stage, "/root/colored_lines")
+
+        ViewerRTX._seed_line_display_color(instancer, viewer._frame_index)
+
+        display_color = UsdGeom.PrimvarsAPI(instancer).GetPrimvar("displayColor")
+        np.testing.assert_allclose(display_color.Get(viewer._frame_index), ((1.0, 0.0, 0.0),))
+
+    def test_viewer_rtx_accepts_both_ldr_color_render_var_keys(self):
+        """Find LDR output with legacy and fully qualified OVRTX keys."""
+
+        class _Frame:
+            def __init__(self, render_vars):
+                self.render_vars = render_vars
+
+        legacy = object()
+        qualified = object()
+
+        self.assertIs(ViewerRTX._get_ldr_color_render_var(_Frame({"LdrColor": legacy})), legacy)
+        self.assertIs(ViewerRTX._get_ldr_color_render_var(_Frame({"/Render/Vars/LdrColor": qualified})), qualified)
+        self.assertIsNone(ViewerRTX._get_ldr_color_render_var(_Frame({})))
+
+    def test_viewer_rtx_line_updates_use_public_array_writes(self):
+        """Write dynamic line arrays without constructing private OVRTX DLTensors."""
+
+        class _RTXRecorder:
+            def __init__(self):
+                self.attribute_writes = []
+                self.array_writes = []
+
+            def write_attribute(self, **kwargs):
+                self.attribute_writes.append(kwargs)
+
+            def write_array_attribute(self, prim_paths, attribute_name, tensors):
+                self.array_writes.append((prim_paths, attribute_name, tensors))
+
+        viewer = ViewerRTX.__new__(ViewerRTX)
+        viewer._rtx = _RTXRecorder()
+        viewer._pending_line_batches = {
+            "/root/custom": (
+                np.asarray(((0.0, 0.0, 0.0),), dtype=np.float32),
+                np.asarray(((0.0, 0.0, 1.0),), dtype=np.float32),
+                np.asarray(((0.0, 1.0, 0.0),), dtype=np.float32),
+                0.01,
+                False,
+            )
+        }
+        viewer._line_batch_paths = {"/root/custom": "/root/custom"}
+        viewer._line_batch_proto_paths = {"/root/custom": "/root/custom/capsule"}
+        viewer._line_batch_widths = {"/root/custom": 0.02}
+
+        viewer._update_ovrtx_line_batches()
+
+        writes = {attribute_name: tensors[0] for _paths, attribute_name, tensors in viewer._rtx.array_writes}
+        self.assertEqual(writes["positions"].shape, (1, 3))
+        self.assertEqual(writes["orientations"].shape, (1, 4))
+        self.assertEqual(writes["scales"].shape, (1, 3))
+        self.assertEqual(writes["primvars:displayColor"].shape, (1, 3))
+        np.testing.assert_allclose(writes["scales"][0, :2], (1.0, 1.0))
+        np.testing.assert_array_equal(writes["protoIndices"], (0,))
+        np.testing.assert_allclose(writes["primvars:displayColor"], ((0.0, 1.0, 0.0),))
+        width_write = next(write for write in viewer._rtx.attribute_writes if write["attribute_name"] == "radius")
+        np.testing.assert_allclose(width_write["tensor"], (0.01,))
+
     def test_viewer_rtx_compensates_preview_surface_opacity(self):
         """Compensate PreviewSurface opacity for RTX rendering layers."""
         viewer = ViewerRTX.__new__(ViewerRTX)
