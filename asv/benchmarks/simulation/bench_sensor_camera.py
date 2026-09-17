@@ -56,6 +56,12 @@ KERNEL_BLOCK_DIM = 64
 RENDER_ORDER = SensorCamera.RenderOrder.TILED
 RENDER_TILE_WIDTH = 8
 RENDER_TILE_HEIGHT = 8
+MULTISAMPLE_COUNT = 4
+ANTI_ALIASING_MODES = [
+    SensorCamera.AntiAliasing.NONE,
+    SensorCamera.AntiAliasing.SSAA,
+    SensorCamera.AntiAliasing.MSAA,
+]
 
 # Arm "ready" pose facing the cabinet drawer, from Isaac Lab's
 # FrankaCabinetDirectEnvCfg (panda_joint* values mapped to the FR3 URDF names).
@@ -254,6 +260,7 @@ class _SensorCameraSceneRig:
         resolution: int,
         render_order: SensorCamera.RenderOrder,
         camera_fov_deg: float = 45.0,
+        anti_aliasing: SensorCamera.AntiAliasing = SensorCamera.AntiAliasing.NONE,
     ):
         world = preset.build()
         _disable_collision_handling(world)
@@ -278,10 +285,16 @@ class _SensorCameraSceneRig:
         self.sensor.default_render_config.tile_height = RENDER_TILE_HEIGHT
         self.sensor.default_render_config.enable_shadows = True
         self.sensor.default_render_config.enable_textures = True
+        self.sensor.default_render_config.anti_aliasing = anti_aliasing
 
+        multisamples = 0 if anti_aliasing == SensorCamera.AntiAliasing.NONE else MULTISAMPLE_COUNT
         # The caller owns the rays and the per-view transforms passed to update().
         self.rays = SensorCamera.compute_camera_rays_pinhole(
-            resolution, resolution, camera_fov=math.radians(camera_fov_deg), device=self.model.device
+            resolution,
+            resolution,
+            camera_fov=math.radians(camera_fov_deg),
+            multisamples=multisamples,
+            device=self.model.device,
         )
         # World-fixed camera: point every world's view from the same look-at pose.
         camera_row = np.array([camera[i] for i in range(7)], dtype=np.float32)
@@ -311,31 +324,39 @@ class _SensorCameraSceneRig:
 class _SceneBenchmark:
     """Shared ASV harness; subclasses pick a scene from :data:`SCENES` and their params."""
 
-    param_names = ["resolution", "world_count", "iterations"]
+    param_names = ["resolution", "world_count", "anti_aliasing", "iterations"]
     scene: str
     render_order = RENDER_ORDER
 
-    def setup(self, resolution: int, world_count: int, iterations: int):
-        self.rig = _SensorCameraSceneRig(SCENES[self.scene], world_count, resolution, self.render_order)
+    def setup(self, resolution: int, world_count: int, anti_aliasing: SensorCamera.AntiAliasing, iterations: int):
+        self.rig = _SensorCameraSceneRig(
+            SCENES[self.scene], world_count, resolution, self.render_order, anti_aliasing=anti_aliasing
+        )
         # Compile and warm the render kernels for every output combination measured below.
         for color, depth in ((True, True), (True, False), (False, True)):
             self.rig.render(color=color, depth=depth)
         wp.synchronize()
 
     @skip_benchmark_if(wp.get_cuda_device_count() == 0)
-    def time_render_color_depth(self, resolution: int, world_count: int, iterations: int):
+    def time_render_color_depth(
+        self, resolution: int, world_count: int, anti_aliasing: SensorCamera.AntiAliasing, iterations: int
+    ):
         for _ in range(iterations):
             self.rig.render(color=True, depth=True)
         wp.synchronize()
 
     @skip_benchmark_if(wp.get_cuda_device_count() == 0)
-    def time_render_color_only(self, resolution: int, world_count: int, iterations: int):
+    def time_render_color_only(
+        self, resolution: int, world_count: int, anti_aliasing: SensorCamera.AntiAliasing, iterations: int
+    ):
         for _ in range(iterations):
             self.rig.render(color=True, depth=False)
         wp.synchronize()
 
     @skip_benchmark_if(wp.get_cuda_device_count() == 0)
-    def time_render_depth_only(self, resolution: int, world_count: int, iterations: int):
+    def time_render_depth_only(
+        self, resolution: int, world_count: int, anti_aliasing: SensorCamera.AntiAliasing, iterations: int
+    ):
         for _ in range(iterations):
             self.rig.render(color=False, depth=True)
         wp.synchronize()
@@ -343,23 +364,23 @@ class _SceneBenchmark:
 
 class SensorCameraQuadruped(_SceneBenchmark):
     scene = "quadruped"
-    params = ([64], [4096], [50])
+    params = ([64], [4096], ANTI_ALIASING_MODES, [50])
 
 
 class FastSensorCamera(_SceneBenchmark):
     scene = "franka_cabinet"
-    params = ([64], [4096], [50])
+    params = ([64], [4096], ANTI_ALIASING_MODES, [50])
 
 
 class FastSensorCameraPixel(_SceneBenchmark):
     scene = "franka_cabinet"
     render_order = SensorCamera.RenderOrder.PIXEL_PRIORITY
-    params = ([64], [4096], [50])
+    params = ([64], [4096], ANTI_ALIASING_MODES, [50])
 
 
 class SensorCameraShapes256(_SceneBenchmark):
     scene = "shapes_256"
-    params = ([64], [4096], [50])
+    params = ([64], [4096], ANTI_ALIASING_MODES, [50])
 
 
 PREVIEW_WORLD_COUNTS = (1, 16)
@@ -392,8 +413,15 @@ def write_preview_images(scene_names: list[str], output_dir: Path, image_size: i
     return written
 
 
-def print_fps(name: str, duration: float, resolution: int, world_count: int, iterations: int):
-    title = f"{name}"
+def print_fps(
+    name: str,
+    duration: float,
+    resolution: int,
+    world_count: int,
+    anti_aliasing: SensorCamera.AntiAliasing,
+    iterations: int,
+):
+    title = f"{name} ({SensorCamera.AntiAliasing(anti_aliasing).name})"
     if iterations > 1:
         title += " average"
 
@@ -403,7 +431,7 @@ def print_fps(name: str, duration: float, resolution: int, world_count: int, ite
     print(f"{title} {'.' * (50 - len(title) - len(average))} {average} {fps if iterations > 1 else ''}")
 
 
-def print_fps_results(results: dict[tuple[str, tuple[int, int, int]], float]):
+def print_fps_results(results: dict[tuple[str, tuple[int, int, int, int]], float]):
     print()
     print("=== Benchmark Results (FPS) ===")
     for (method_name, params), avg in results.items():

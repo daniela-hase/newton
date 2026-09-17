@@ -23,8 +23,8 @@ _IDENTITY_XFORM = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32
 
 class TestSensorCamera(unittest.TestCase):
     @staticmethod
-    def _rays(width: int, height: int, fov: float = math.radians(45.0), device: str = "cpu") -> wp.array3d[wp.vec3f]:
-        """Camera-space pinhole rays, shape ``(height, width, 2)``."""
+    def _rays(width: int, height: int, fov: float = math.radians(45.0), device: str = "cpu") -> wp.array4d[wp.vec3f]:
+        """Camera-space pinhole rays, shape ``(height, width, 1, 2)``."""
         return SensorCamera.compute_camera_rays_pinhole(width, height, fov, device=device)
 
     @staticmethod
@@ -211,13 +211,13 @@ class TestSensorCamera(unittest.TestCase):
         ]
 
         for ray_bundle in rays:
-            self.assertEqual(ray_bundle.shape, (height, width, 2))
+            self.assertEqual(ray_bundle.shape, (height, width, 1, 2))
             self.assertEqual(ray_bundle.dtype, wp.vec3f)
 
     def test_camera_ray_helpers_support_preallocated_output(self) -> None:
         """Verify camera ray helpers can write into caller output arrays."""
         width, height = 4, 3
-        out_rays = wp.zeros((height, width, 2), dtype=wp.vec3f, device="cpu")
+        out_rays = wp.zeros((height, width, 1, 2), dtype=wp.vec3f, device="cpu")
 
         rays = SensorCamera.compute_camera_rays_pinhole(
             width, height, math.radians(45.0), out_rays=out_rays, device="cpu"
@@ -225,6 +225,55 @@ class TestSensorCamera(unittest.TestCase):
 
         self.assertIs(rays, out_rays)
         self.assertFalse(np.allclose(rays.numpy(), 0.0))
+
+    def test_camera_ray_helpers_generate_multisamples(self) -> None:
+        """Generate distinct subpixel rays from every camera model."""
+        width, height = 4, 3
+        default_rays = SensorCamera.compute_camera_rays_pinhole(width, height, math.radians(45.0), device="cpu")
+        one_sample_rays = SensorCamera.compute_camera_rays_pinhole(
+            width, height, math.radians(45.0), multisamples=1, device="cpu"
+        )
+        multisample_rays = SensorCamera.compute_camera_rays_pinhole(
+            width, height, math.radians(45.0), multisamples=4, device="cpu"
+        )
+
+        self.assertEqual(default_rays.shape, (height, width, 1, 2))
+        self.assertEqual(one_sample_rays.shape, (height, width, 1, 2))
+        self.assertEqual(multisample_rays.shape, (height, width, 4, 2))
+        np.testing.assert_allclose(one_sample_rays.numpy(), default_rays.numpy(), atol=1.0e-6)
+        sample_directions = multisample_rays.numpy()[1, 1, :, 1]
+        self.assertFalse(np.allclose(sample_directions, sample_directions[0]))
+        np.testing.assert_allclose(np.linalg.norm(sample_directions, axis=1), 1.0, atol=1.0e-6)
+
+        fisheye_rays = (
+            SensorCamera.compute_camera_rays_fisheye_opencv(
+                width, height, fx=2.0, fy=2.0, cx=2.0, cy=1.5, multisamples=4, device="cpu"
+            ),
+            SensorCamera.compute_camera_rays_fisheye_ftheta(
+                width, height, optical_center_x=2.0, optical_center_y=1.5, multisamples=4, device="cpu"
+            ),
+            SensorCamera.compute_camera_rays_fisheye_kannala_brandt(
+                width, height, optical_center_x=2.0, optical_center_y=1.5, multisamples=4, device="cpu"
+            ),
+        )
+        for rays in fisheye_rays:
+            self.assertEqual(rays.shape, (height, width, 4, 2))
+            directions = rays.numpy()[1, 1, :, 1]
+            self.assertFalse(np.allclose(directions, directions[0]))
+
+        out_rays = wp.empty((height, width, 4, 2), dtype=wp.vec3f, device="cpu")
+        rays = SensorCamera.compute_camera_rays_pinhole(
+            width,
+            height,
+            focal_length=1.0,
+            horizontal_aperture=2.0,
+            vertical_aperture=1.5,
+            multisamples=4,
+            out_rays=out_rays,
+        )
+        self.assertIs(rays, out_rays)
+        with self.assertRaisesRegex(ValueError, "multisamples must be non-negative"):
+            SensorCamera.compute_camera_rays_pinhole(width, height, 1.0, multisamples=-1, device="cpu")
 
     def test_camera_ray_helpers_reject_batched_inputs(self) -> None:
         """Verify camera ray helpers accept only single-camera parameters."""
@@ -284,9 +333,170 @@ class TestSensorCamera(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "camera_rays must have dtype"):
             camera.update(state, camera_transforms, camera_transforms)
         with self.assertRaisesRegex(ValueError, "camera_rays must have shape"):
-            camera.update(state, camera_transforms, rays.reshape((1, height, width, 2)))
+            camera.update(state, camera_transforms, wp.zeros((height, width, 2, 3), dtype=wp.vec3f, device="cpu"))
         with self.assertRaises(TypeError):
             camera.update(state, camera_transforms, np.zeros((height, width, 2), dtype=np.float32))
+
+    def _resolve_multisampled_against_legacy(self, anti_aliasing) -> None:
+        """Render a one-hit/one-miss bundle and compare it to the single-ray baseline.
+
+        The bundle's first sample hits the sphere and its second sample has a zero
+        direction (a forced miss), so SSAA and MSAA both blend the sphere against the
+        clear color while keeping nearest-hit depth, normal, and shape index.
+        """
+        model, camera = self._build_sphere_scene()
+        state = model.state()
+        transforms = self._identity_transforms(1)
+        single_sample_rays = self._rays(1, 1)
+        legacy_rays = single_sample_rays.reshape((1, 1, 2))
+        ray_values = single_sample_rays.numpy()
+        multisample_values = np.zeros((1, 1, 2, 2, 3), dtype=np.float32)
+        multisample_values[:, :, 0] = ray_values[:, :, 0]
+        multisample_rays = wp.array(multisample_values, dtype=wp.vec3f, device="cpu")
+
+        legacy_color = camera.create_color_image_output(1, 1, 1)
+        multisample_color = camera.create_color_image_output(1, 1, 1)
+        legacy_depth = camera.create_depth_image_output(1, 1, 1)
+        multisample_depth = camera.create_depth_image_output(1, 1, 1)
+        legacy_forward_depth = camera.create_forward_depth_image_output(1, 1, 1)
+        multisample_forward_depth = camera.create_forward_depth_image_output(1, 1, 1)
+        legacy_normal = camera.create_normal_image_output(1, 1, 1)
+        multisample_normal = camera.create_normal_image_output(1, 1, 1)
+        legacy_shape_index = camera.create_shape_index_image_output(1, 1, 1)
+        multisample_shape_index = camera.create_shape_index_image_output(1, 1, 1)
+        camera.update(
+            state,
+            transforms,
+            legacy_rays,
+            color_image=legacy_color,
+            depth_image=legacy_depth,
+            forward_depth_image=legacy_forward_depth,
+            normal_image=legacy_normal,
+            shape_index_image=legacy_shape_index,
+        )
+        camera.update(
+            state,
+            transforms,
+            multisample_rays,
+            color_image=multisample_color,
+            depth_image=multisample_depth,
+            forward_depth_image=multisample_forward_depth,
+            normal_image=multisample_normal,
+            shape_index_image=multisample_shape_index,
+            render_config=camera.RenderConfig(anti_aliasing=anti_aliasing),
+        )
+
+        self.assertNotEqual(int(multisample_color.numpy()[0, 0, 0]), int(legacy_color.numpy()[0, 0, 0]))
+        np.testing.assert_allclose(multisample_depth.numpy(), legacy_depth.numpy(), atol=1.0e-6)
+        np.testing.assert_allclose(multisample_forward_depth.numpy(), legacy_forward_depth.numpy(), atol=1.0e-6)
+        np.testing.assert_allclose(multisample_normal.numpy(), legacy_normal.numpy(), atol=1.0e-6)
+        np.testing.assert_array_equal(multisample_shape_index.numpy(), legacy_shape_index.numpy())
+
+    def test_update_resolves_ssaa_rays(self) -> None:
+        """Supersample color across all pixel rays and retain nearest-hit geometry."""
+        self._resolve_multisampled_against_legacy(SensorCamera.AntiAliasing.SSAA)
+
+    def test_update_resolves_msaa_rays(self) -> None:
+        """Multisample coverage while shading only the nearest hit once."""
+        self._resolve_multisampled_against_legacy(SensorCamera.AntiAliasing.MSAA)
+
+    def test_msaa_blends_overlapping_objects_without_background(self) -> None:
+        """Blend two objects at an edge instead of bleeding the background.
+
+        When a pixel's subsamples land on two different objects (never the background),
+        MSAA must shade both surfaces and composite them - matching SSAA and staying
+        fully opaque - rather than painting the nearest object or blending toward the
+        clear color.
+        """
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        red_body = builder.add_body(xform=wp.transform(p=wp.vec3(-0.3, 0.0, -2.0), q=wp.quat_identity()))
+        builder.add_shape_sphere(red_body, radius=0.5, color=(1.0, 0.0, 0.0))
+        blue_body = builder.add_body(xform=wp.transform(p=wp.vec3(0.3, 0.0, -2.0), q=wp.quat_identity()))
+        builder.add_shape_sphere(blue_body, radius=0.5, color=(0.0, 0.0, 1.0))
+        model = builder.finalize(device="cpu")
+        camera = SensorCamera(model)
+        state = model.state()
+        transforms = self._identity_transforms(1)
+
+        dir_red = np.array([-0.3, 0.0, -2.0], dtype=np.float32)
+        dir_red /= np.linalg.norm(dir_red)
+        dir_blue = np.array([0.3, 0.0, -2.0], dtype=np.float32)
+        dir_blue /= np.linalg.norm(dir_blue)
+
+        def _single_ray(direction: np.ndarray) -> wp.array4d[wp.vec3f]:
+            values = np.zeros((1, 1, 1, 2, 3), dtype=np.float32)
+            values[0, 0, 0, 1] = direction
+            return wp.array(values, dtype=wp.vec3f, device="cpu")
+
+        bundle_values = np.zeros((1, 1, 2, 2, 3), dtype=np.float32)
+        bundle_values[0, 0, 0, 1] = dir_red
+        bundle_values[0, 0, 1, 1] = dir_blue
+        bundle_rays = wp.array(bundle_values, dtype=wp.vec3f, device="cpu")
+
+        red_color = camera.create_color_image_output(1, 1, 1)
+        blue_color = camera.create_color_image_output(1, 1, 1)
+        msaa_color = camera.create_color_image_output(1, 1, 1)
+        ssaa_color = camera.create_color_image_output(1, 1, 1)
+        camera.update(state, transforms, _single_ray(dir_red), color_image=red_color)
+        camera.update(state, transforms, _single_ray(dir_blue), color_image=blue_color)
+        camera.update(
+            state,
+            transforms,
+            bundle_rays,
+            color_image=msaa_color,
+            render_config=camera.RenderConfig(anti_aliasing=SensorCamera.AntiAliasing.MSAA),
+        )
+        camera.update(
+            state,
+            transforms,
+            bundle_rays,
+            color_image=ssaa_color,
+            render_config=camera.RenderConfig(anti_aliasing=SensorCamera.AntiAliasing.SSAA),
+        )
+
+        red_packed = int(red_color.numpy()[0, 0, 0])
+        blue_packed = int(blue_color.numpy()[0, 0, 0])
+        msaa_packed = int(msaa_color.numpy()[0, 0, 0])
+        # Both surfaces contribute: the blend matches neither object rendered alone.
+        self.assertNotIn(msaa_packed, (red_packed, blue_packed))
+        # Every subsample hit geometry, so the pixel stays fully opaque - no background bleed.
+        self.assertEqual((msaa_packed >> 24) & 0xFF, 255)
+        # Shading each surface once yields the same composite as supersampling here.
+        self.assertEqual(msaa_packed, int(ssaa_color.numpy()[0, 0, 0]))
+        # The red and blue channels are both present in the blend.
+        self.assertGreater(msaa_packed & 0xFF, 0)
+        self.assertGreater((msaa_packed >> 16) & 0xFF, 0)
+
+    def test_update_none_mode_ignores_extra_samples(self) -> None:
+        """Render only the first sample when anti-aliasing is disabled.
+
+        A multisampled bundle whose first sample matches the single-ray baseline must
+        produce identical output under ``AntiAliasing.NONE`` regardless of later
+        samples.
+        """
+        model, camera = self._build_sphere_scene()
+        state = model.state()
+        transforms = self._identity_transforms(1)
+        single_sample_rays = self._rays(1, 1)
+        ray_values = single_sample_rays.numpy()
+        # First sample reproduces the baseline ray; the second is a forced miss that
+        # ``NONE`` must ignore entirely.
+        multisample_values = np.zeros((1, 1, 2, 2, 3), dtype=np.float32)
+        multisample_values[:, :, 0] = ray_values[:, :, 0]
+        multisample_rays = wp.array(multisample_values, dtype=wp.vec3f, device="cpu")
+
+        baseline_color = camera.create_color_image_output(1, 1, 1)
+        none_color = camera.create_color_image_output(1, 1, 1)
+        camera.update(state, transforms, single_sample_rays, color_image=baseline_color)
+        camera.update(
+            state,
+            transforms,
+            multisample_rays,
+            color_image=none_color,
+            render_config=camera.RenderConfig(anti_aliasing=SensorCamera.AntiAliasing.NONE),
+        )
+
+        np.testing.assert_array_equal(none_color.numpy(), baseline_color.numpy())
 
     def test_sync_transforms_is_explicit_and_not_called_by_update(self) -> None:
         """Verify update() no longer synchronizes render state; sync_transforms does it explicitly."""

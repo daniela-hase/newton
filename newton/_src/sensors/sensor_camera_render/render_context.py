@@ -230,7 +230,7 @@ class RenderContext:
         state: State,
         *,
         camera_transforms: wp.array[wp.transformf],
-        camera_rays: wp.array3d[wp.vec3f],
+        camera_rays: wp.array4d[wp.vec3f],
         world_indices: wp.array[wp.int32] | None = None,
         color_image: wp.array3d[wp.uint32] | None = None,
         hdr_color_image: wp.array3d[wp.vec3f] | None = None,
@@ -262,7 +262,7 @@ class RenderContext:
             camera_transforms: Per-view camera transforms, shape
                 ``(view_count,)``.
             camera_rays: Ray origins and directions, shape
-                ``(height, width, 2)``.
+                ``(height, width, sample_count, 2)``.
             world_indices: Optional per-view world selector, shape
                 ``(view_count,)``, dtype ``int32``. A non-negative entry is the
                 model world index rendered for that view; a negative entry
@@ -342,8 +342,10 @@ class RenderContext:
                 if image is not None and image.shape != expected:
                     raise ValueError(f"{name} shape must be {expected}, got {tuple(image.shape)}")
 
-            if camera_rays.shape != (height, width, 2):
-                raise ValueError(f"camera_rays shape must be ({height}, {width}, 2), got {tuple(camera_rays.shape)}")
+            if camera_rays.ndim != 4 or camera_rays.shape[2] <= 0 or camera_rays.shape[3] != 2:
+                raise ValueError(
+                    f"camera_rays shape must be ({height}, {width}, sample_count, 2), got {tuple(camera_rays.shape)}"
+                )
             # ``world_indices`` is optional: when ``None`` each view renders its own
             # world (``world_index == view_index``); otherwise validate the mapping.
             if world_indices is not None:

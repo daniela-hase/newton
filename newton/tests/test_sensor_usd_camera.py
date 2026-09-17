@@ -237,11 +237,26 @@ class TestSensorCameraRays(unittest.TestCase):
 
         got_prim = SensorCamera.compute_camera_rays_usd_pinhole(width, height, camera.GetPrim(), device="cpu")
         got_camera = SensorCamera.compute_camera_rays_usd_pinhole(width, height, camera, device="cpu")
+        expected_multisample = SensorCamera.compute_camera_rays_pinhole(
+            width,
+            height,
+            focal_length=1.5,
+            horizontal_aperture=2.0,
+            vertical_aperture=1.0,
+            horizontal_aperture_offset=0.1,
+            vertical_aperture_offset=0.2,
+            multisamples=4,
+            device="cpu",
+        )
+        got_multisample = SensorCamera.compute_camera_rays_usd_pinhole(
+            width, height, camera, multisamples=4, device="cpu"
+        )
 
-        self.assertEqual(got_prim.shape, (height, width, 2))
+        self.assertEqual(got_prim.shape, (height, width, 1, 2))
         self.assertEqual(got_prim.dtype, wp.vec3f)
         np.testing.assert_allclose(got_prim.numpy(), expected, atol=1e-6)
         np.testing.assert_allclose(got_camera.numpy(), expected, atol=1e-6)
+        np.testing.assert_allclose(got_multisample.numpy(), expected_multisample.numpy(), atol=1e-6)
 
     @unittest.skipIf(Usd is None, "Requires USD Python bindings")
     def test_sensor_camera_usd_pinhole_rejects_invalid_prim(self):

@@ -64,8 +64,9 @@ def compute_camera_rays_usd_pinhole(
     *,
     device: wp.Device,
     time: UsdTime | None = None,
-    out_rays: wp.array3d[wp.vec3f],
-) -> wp.array3d[wp.vec3f]:
+    multisamples: int = 0,
+    out_rays: wp.array4d[wp.vec3f],
+) -> wp.array4d[wp.vec3f]:
     time_code = _coerce_usd_time(time)
     usd_camera = _normalize_usd_camera(camera)
     projection = str(usd_camera.GetProjectionAttr().Get(time_code))
@@ -75,7 +76,7 @@ def compute_camera_rays_usd_pinhole(
 
     wp.launch(
         kernel=compute_camera_rays_pinhole_from_aperture_kernel,
-        dim=(height, width),
+        dim=(height, width, max(multisamples, 1)),
         inputs=[
             width,
             height,
@@ -84,6 +85,7 @@ def compute_camera_rays_usd_pinhole(
             float(usd_camera.GetVerticalApertureAttr().Get(time_code)),
             float(usd_camera.GetHorizontalApertureOffsetAttr().Get(time_code)),
             float(usd_camera.GetVerticalApertureOffsetAttr().Get(time_code)),
+            multisamples,
             out_rays,
         ],
         device=device,
@@ -234,21 +236,35 @@ def _fisheye_direction_from_theta(x: wp.float32, y: wp.float32, radius: wp.float
     return wp.vec3f((x / radius) * sin_theta, (y / radius) * sin_theta, -wp.cos(theta))
 
 
+@wp.func
+def _multisample_offset(sample_index: int, multisamples: int):
+    if multisamples <= 1:
+        return wp.vec2f(0.5, 0.5)
+
+    # Use a deterministic low-discrepancy sequence so every invocation produces
+    # the same subpixel pattern without requiring an RNG state from the caller.
+    u = (float(sample_index) + 0.5) / float(multisamples)
+    v = wp.mod((float(sample_index) + 0.5) * 0.61803398875, 1.0)
+    return wp.vec2f(u, v)
+
+
 @wp.kernel(enable_backward=False)
 def compute_camera_rays_pinhole(
     width: int,
     height: int,
     camera_fov: wp.float32,
-    out_rays: wp.array3d[wp.vec3f],
+    multisamples: int,
+    out_rays: wp.array4d[wp.vec3f],
 ):
-    py, px = wp.tid()
+    py, px, sample_index = wp.tid()
+    offset = _multisample_offset(sample_index, multisamples)
     aspect_ratio = float(width) / float(height)
-    u = (float(px) + 0.5) / float(width) - 0.5
-    v = (float(py) + 0.5) / float(height) - 0.5
+    u = (float(px) + offset[0]) / float(width) - 0.5
+    v = (float(py) + offset[1]) / float(height) - 0.5
     h = wp.tan(camera_fov / 2.0)
     ray_direction_camera_space = wp.vec3f(u * 2.0 * h * aspect_ratio, -v * 2.0 * h, -1.0)
-    out_rays[py, px, 0] = wp.vec3f(0.0)
-    out_rays[py, px, 1] = wp.normalize(ray_direction_camera_space)
+    out_rays[py, px, sample_index, 0] = wp.vec3f(0.0)
+    out_rays[py, px, sample_index, 1] = wp.normalize(ray_direction_camera_space)
 
 
 @wp.kernel(enable_backward=False)
@@ -260,16 +276,18 @@ def compute_camera_rays_pinhole_from_aperture_kernel(
     vertical_aperture: wp.float32,
     horizontal_aperture_offset: wp.float32,
     vertical_aperture_offset: wp.float32,
-    out_rays: wp.array3d[wp.vec3f],
+    multisamples: int,
+    out_rays: wp.array4d[wp.vec3f],
 ):
-    py, px = wp.tid()
-    u = (float(px) + 0.5) / float(width)
-    v = (float(py) + 0.5) / float(height)
+    py, px, sample_index = wp.tid()
+    offset = _multisample_offset(sample_index, multisamples)
+    u = (float(px) + offset[0]) / float(width)
+    v = (float(py) + offset[1]) / float(height)
     film_x = (u - 0.5) * horizontal_aperture + horizontal_aperture_offset
     film_y = (0.5 - v) * vertical_aperture + vertical_aperture_offset
     ray_direction_camera_space = wp.vec3f(film_x / focal_length, film_y / focal_length, -1.0)
-    out_rays[py, px, 0] = wp.vec3f(0.0)
-    out_rays[py, px, 1] = wp.normalize(ray_direction_camera_space)
+    out_rays[py, px, sample_index, 0] = wp.vec3f(0.0)
+    out_rays[py, px, sample_index, 1] = wp.normalize(ray_direction_camera_space)
 
 
 @wp.kernel(enable_backward=False)
@@ -287,11 +305,13 @@ def compute_camera_rays_fisheye_opencv_kernel(
     k3: wp.float32,
     k4: wp.float32,
     max_fov: wp.float32,
-    out_rays: wp.array3d[wp.vec3f],
+    multisamples: int,
+    out_rays: wp.array4d[wp.vec3f],
 ):
-    py, px = wp.tid()
-    u = ((float(px) + 0.5) / float(width)) * image_width
-    v = ((float(py) + 0.5) / float(height)) * image_height
+    py, px, sample_index = wp.tid()
+    offset = _multisample_offset(sample_index, multisamples)
+    u = ((float(px) + offset[0]) / float(width)) * image_width
+    v = ((float(py) + offset[1]) / float(height)) * image_height
     x = (u - cx) / fx
     y = -(v - cy) / fy
     radius = wp.sqrt(x * x + y * y)
@@ -305,8 +325,8 @@ def compute_camera_rays_fisheye_opencv_kernel(
     )
     ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
 
-    out_rays[py, px, 0] = wp.vec3f(0.0)
-    out_rays[py, px, 1] = ray_direction_camera_space
+    out_rays[py, px, sample_index, 0] = wp.vec3f(0.0)
+    out_rays[py, px, sample_index, 1] = ray_direction_camera_space
 
 
 @wp.kernel(enable_backward=False)
@@ -323,11 +343,13 @@ def compute_camera_rays_fisheye_ftheta_kernel(
     k3: wp.float32,
     k4: wp.float32,
     max_fov: wp.float32,
-    out_rays: wp.array3d[wp.vec3f],
+    multisamples: int,
+    out_rays: wp.array4d[wp.vec3f],
 ):
-    py, px = wp.tid()
-    u = ((float(px) + 0.5) / float(width)) * nominal_width
-    v = ((float(py) + 0.5) / float(height)) * nominal_height
+    py, px, sample_index = wp.tid()
+    offset = _multisample_offset(sample_index, multisamples)
+    u = ((float(px) + offset[0]) / float(width)) * nominal_width
+    v = ((float(py) + offset[1]) / float(height)) * nominal_height
     x = u - optical_center_x
     y = -(v - optical_center_y)
     radius = wp.sqrt(x * x + y * y)
@@ -343,8 +365,8 @@ def compute_camera_rays_fisheye_ftheta_kernel(
     )
     ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
 
-    out_rays[py, px, 0] = wp.vec3f(0.0)
-    out_rays[py, px, 1] = ray_direction_camera_space
+    out_rays[py, px, sample_index, 0] = wp.vec3f(0.0)
+    out_rays[py, px, sample_index, 1] = ray_direction_camera_space
 
 
 @wp.kernel(enable_backward=False)
@@ -360,11 +382,13 @@ def compute_camera_rays_fisheye_kannala_brandt_kernel(
     k2: wp.float32,
     k3: wp.float32,
     max_fov: wp.float32,
-    out_rays: wp.array3d[wp.vec3f],
+    multisamples: int,
+    out_rays: wp.array4d[wp.vec3f],
 ):
-    py, px = wp.tid()
-    u = ((float(px) + 0.5) / float(width)) * nominal_width
-    v = ((float(py) + 0.5) / float(height)) * nominal_height
+    py, px, sample_index = wp.tid()
+    offset = _multisample_offset(sample_index, multisamples)
+    u = ((float(px) + offset[0]) / float(width)) * nominal_width
+    v = ((float(py) + offset[1]) / float(height)) * nominal_height
     x = u - optical_center_x
     y = -(v - optical_center_y)
     radius = wp.sqrt(x * x + y * y)
@@ -379,5 +403,5 @@ def compute_camera_rays_fisheye_kannala_brandt_kernel(
     )
     ray_direction_camera_space = _fisheye_direction_from_theta(x, y, radius, theta)
 
-    out_rays[py, px, 0] = wp.vec3f(0.0)
-    out_rays[py, px, 1] = ray_direction_camera_space
+    out_rays[py, px, sample_index, 0] = wp.vec3f(0.0)
+    out_rays[py, px, sample_index, 1] = ray_direction_camera_space
