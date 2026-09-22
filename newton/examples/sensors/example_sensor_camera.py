@@ -32,6 +32,12 @@ SEMANTIC_COLOR_MESH = (0, 255, 0)
 SEMANTIC_COLOR_ROBOT = (255, 0, 255)
 SEMANTIC_COLOR_GAUSSIAN = (255, 153, 0)
 SEMANTIC_COLOR_GROUND_PLANE = (68, 68, 68)
+MULTISAMPLE_OPTIONS = (0, 4, 16)
+ANTI_ALIASING_OPTIONS = (
+    SensorCamera.AntiAliasing.NONE,
+    SensorCamera.AntiAliasing.SSAA,
+    SensorCamera.AntiAliasing.MSAA,
+)
 
 
 # Sweeping every Franka joint across its full URDF range yields poses that
@@ -118,9 +124,10 @@ class Example:
         self.sensor_color_as_main_view = False
         self.disable_clear_worlds = False
         self.disable_preserve_worlds = False
+        self.multisamples = 0
 
-        self.sensor_render_width = 256
-        self.sensor_render_height = 256
+        self.sensor_render_width = 16
+        self.sensor_render_height = 16
 
         fov = 45.0
         if isinstance(self.viewer, ViewerGL):
@@ -265,12 +272,7 @@ class Example:
         # The caller owns the camera-space rays and the per-view world-space camera
         # transforms passed to SensorCamera.update(); the observer camera is world-
         # fixed, the robot camera is mounted on a link (see _update_camera_transforms).
-        self.sensor_camera_rays = SensorCamera.compute_camera_rays_pinhole(
-            W, H, camera_fov=self.observer_camera_fov, device=self.model.device
-        )
-        self.robot_sensor_camera_rays = SensorCamera.compute_camera_rays_pinhole(
-            W, H, camera_fov=self.robot_camera_fov, device=self.model.device
-        )
+        self._update_camera_rays()
         self.sensor_camera_transforms = wp.empty(view_count, dtype=wp.transformf, device=self.model.device)
         self.robot_sensor_camera_transforms = wp.empty(view_count, dtype=wp.transformf, device=self.model.device)
 
@@ -401,6 +403,22 @@ class Example:
             )
         return camera_transforms
 
+    def _update_camera_rays(self):
+        self.sensor_camera_rays = SensorCamera.compute_camera_rays_pinhole(
+            self.sensor_render_width,
+            self.sensor_render_height,
+            camera_fov=self.observer_camera_fov,
+            multisamples=self.multisamples,
+            device=self.model.device,
+        )
+        self.robot_sensor_camera_rays = SensorCamera.compute_camera_rays_pinhole(
+            self.sensor_render_width,
+            self.sensor_render_height,
+            camera_fov=self.robot_camera_fov,
+            multisamples=self.multisamples,
+            device=self.model.device,
+        )
+
     def _update_world_indices(self):
         if not self._world_indices_dirty:
             return
@@ -526,6 +544,15 @@ class Example:
         if ui.radio_button("Robot Camera", self.show_robot_camera):
             self.show_robot_camera = True
 
+        multisample_index = MULTISAMPLE_OPTIONS.index(self.multisamples)
+        changed, multisample_index = ui.combo(
+            "Multisamples", multisample_index, tuple(str(value) for value in MULTISAMPLE_OPTIONS)
+        )
+        if changed:
+            self.multisamples = MULTISAMPLE_OPTIONS[multisample_index]
+            self._update_camera_rays()
+            show_compile_kernel_info = True
+
         if isinstance(self.viewer, ViewerGL):
             _changed, self.sensor_color_as_main_view = ui.checkbox(
                 "Sensor Color as Main View", self.sensor_color_as_main_view
@@ -543,6 +570,14 @@ class Example:
         render_config = (
             self.robot_sensor_camera if self.show_robot_camera else self.sensor_camera
         ).default_render_config
+
+        anti_aliasing_index = ANTI_ALIASING_OPTIONS.index(SensorCamera.AntiAliasing(render_config.anti_aliasing))
+        changed, anti_aliasing_index = ui.combo(
+            "Anti-aliasing", anti_aliasing_index, tuple(mode.name for mode in ANTI_ALIASING_OPTIONS)
+        )
+        if changed:
+            render_config.anti_aliasing = ANTI_ALIASING_OPTIONS[anti_aliasing_index]
+            show_compile_kernel_info = True
 
         if ui.radio_button(
             "Gaussians: Fast",
